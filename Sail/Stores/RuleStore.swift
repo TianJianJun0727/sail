@@ -8,7 +8,7 @@ enum RuleMatch: String, Codable, CaseIterable, Identifiable {
     case ruleSetURL
     case inline
     var id: String { rawValue }
-    var label: String {
+    nonisolated var label: String {
         switch self {
         case .domainSuffix: "域名后缀"
         case .domainKeyword: "域名关键词"
@@ -23,7 +23,7 @@ enum RuleMatch: String, Codable, CaseIterable, Identifiable {
         case .inline: "INLINE 复合"
         }
     }
-    var singBoxKey: String {
+    nonisolated var singBoxKey: String {
         switch self {
         case .domainSuffix: "domain_suffix"
         case .domainKeyword: "domain_keyword"
@@ -36,6 +36,20 @@ enum RuleMatch: String, Codable, CaseIterable, Identifiable {
         case .inline: ""   // 不走通用 key，整段 JSON 即规则
         }
     }
+
+    nonisolated init?(singBoxKey: String) {
+        switch singBoxKey {
+        case Self.domainSuffix.singBoxKey: self = .domainSuffix
+        case Self.domainKeyword.singBoxKey: self = .domainKeyword
+        case Self.domain.singBoxKey: self = .domain
+        case Self.ipCIDR.singBoxKey: self = .ipCIDR
+        case Self.processName.singBoxKey: self = .processName
+        case Self.port.singBoxKey: self = .port
+        case Self.proto.singBoxKey: self = .proto
+        default: return nil
+        }
+    }
+
     var placeholder: String {
         switch self {
         case .domainSuffix: "example.com"
@@ -71,7 +85,7 @@ enum RuleMatch: String, Codable, CaseIterable, Identifiable {
 enum RuleAction: String, Codable, CaseIterable, Identifiable {
     case proxy, direct, reject
     var id: String { rawValue }
-    var label: String {
+    nonisolated var label: String {
         switch self {
         case .proxy: "代理"
         case .direct: "直连"
@@ -85,10 +99,20 @@ struct RoutingRule: Codable, Identifiable, Equatable {
     var match: RuleMatch = .domainSuffix
     var value: String = ""
     var action: RuleAction = .proxy
+    var outbound: String? = nil
     var enabled: Bool = true
+
+    nonisolated var targetLabel: String {
+        let target = outbound?.trimmingCharacters(in: .whitespaces)
+        return target?.isEmpty == false ? target! : action.label
+    }
+
+    nonisolated var targetColorKey: String {
+        outbound?.trimmingCharacters(in: .whitespaces).isEmpty == false ? "proxy" : action.rawValue
+    }
 }
 
-/// 用户自定义分流规则。优先级高于内置（geosite/geoip-cn）分流，注入运行配置后即时重启生效。
+/// 用户手动维护的分流规则。注入运行配置后即时重启生效。
 @MainActor
 @Observable
 final class RuleStore {
@@ -110,6 +134,40 @@ final class RuleStore {
 
     func remove(_ id: UUID) { rules.removeAll { $0.id == id }; persistAndApply() }
 
+    func moveVisible(_ visibleIDs: [UUID], fromOffsets: IndexSet, toOffset: Int) {
+        let uniqueVisibleIDs = Set(visibleIDs)
+        if uniqueVisibleIDs.count != visibleIDs.count {
+            // 检测到重复 ID，先修复数据
+            let repaired = ensureUniqueRuleIDs()
+            save()
+            if repaired {
+                // ID 已修复，但本次操作的 visibleIDs 已失效（ID 已被重新生成）
+                // 不静默丢弃操作，而是返回让 UI 刷新后用户可重试
+                // TODO: 未来可考虑添加通知机制告知 UI 数据已修复
+                return
+            }
+        }
+        guard !visibleIDs.isEmpty else { return }
+        var reorderedVisibleIDs = visibleIDs
+        let moving = fromOffsets.sorted().map { reorderedVisibleIDs[$0] }
+        for index in fromOffsets.sorted(by: >) {
+            reorderedVisibleIDs.remove(at: index)
+        }
+        let removedBeforeDestination = fromOffsets.filter { $0 < toOffset }.count
+        let adjustedDestination = max(0, min(toOffset - removedBeforeDestination, reorderedVisibleIDs.count))
+        reorderedVisibleIDs.insert(contentsOf: moving, at: adjustedDestination)
+        let visibleSet = uniqueVisibleIDs
+        let byID = Dictionary(uniqueKeysWithValues: rules.map { ($0.id, $0) })
+        var nextVisibleIndex = 0
+        for index in rules.indices where visibleSet.contains(rules[index].id) {
+            guard nextVisibleIndex < reorderedVisibleIDs.count,
+                  let replacement = byID[reorderedVisibleIDs[nextVisibleIndex]] else { continue }
+            rules[index] = replacement
+            nextVisibleIndex += 1
+        }
+        persistAndApply()
+    }
+
     func setEnabled(_ id: UUID, _ on: Bool) {
         guard let i = rules.firstIndex(where: { $0.id == id }) else { return }
         rules[i].enabled = on
@@ -118,7 +176,7 @@ final class RuleStore {
 
     /// 转成 sing-box route 规则（按列表顺序）。代理类规则仅在有代理出站时才加入，去向 = 主选择器 tag。
     /// proxyTag 为 nil 表示无可用代理出站（跳过所有「走代理」规则）。
-    func singBoxRules(proxyTag: String?) -> [[String: Any]] {
+    func singBoxRules(proxyTag: String?, validOutboundTags: Set<String> = []) -> [[String: Any]] {
         var out: [[String: Any]] = []
         for r in rules where r.enabled {
             let v = r.value.trimmingCharacters(in: .whitespaces)
@@ -161,14 +219,19 @@ final class RuleStore {
                 dict = [r.match.singBoxKey: [v]]
             }
             if applyAction {
-                switch r.action {
-                case .proxy:
-                    guard let pt = proxyTag else { continue }
-                    dict["outbound"] = pt
-                case .direct:
-                    dict["outbound"] = "direct"
-                case .reject:
-                    dict["action"] = "reject"
+                if let target = r.outbound?.trimmingCharacters(in: .whitespaces), !target.isEmpty {
+                    guard validOutboundTags.contains(target) else { continue }
+                    dict["outbound"] = target
+                } else {
+                    switch r.action {
+                    case .proxy:
+                        guard let pt = proxyTag else { continue }
+                        dict["outbound"] = pt
+                    case .direct:
+                        dict["outbound"] = "direct"
+                    case .reject:
+                        dict["action"] = "reject"
+                    }
                 }
             }
             out.append(dict)
@@ -277,9 +340,11 @@ final class RuleStore {
     }
 
     private func load() {
+        var repaired = false
         if let data = try? Data(contentsOf: fileURL) {
             do {
                 rules = try JSONDecoder().decode([RoutingRule].self, from: data)
+                repaired = ensureUniqueRuleIDs()
             } catch {
                 // 文件存在但解码失败（损坏/字段不兼容）：备份原文件，避免随后 save() 用空数据覆盖
                 let backup = fileURL.appendingPathExtension("corrupt")
@@ -287,7 +352,7 @@ final class RuleStore {
                 try? FileManager.default.copyItem(at: fileURL, to: backup)
             }
         }
-        // 仅首次（从未种过）且为空时，内置「国内 IP 直连」默认规则；
+        // 仅首次（从未种过）且为空时，写入两条默认手动规则；
         // 之后即使用户清空也不再补，尊重其选择。
         let key = "rulesSeeded"
         if !UserDefaults.standard.bool(forKey: key) {
@@ -300,6 +365,24 @@ final class RuleStore {
                 save()
             }
         }
+        if repaired { save() }
+    }
+
+    @discardableResult
+    private func ensureUniqueRuleIDs() -> Bool {
+        var seen = Set<UUID>()
+        var changed = false
+        for index in rules.indices {
+            if seen.insert(rules[index].id).inserted { continue }
+            var rule = rules[index]
+            repeat {
+                rule.id = UUID()
+            } while seen.contains(rule.id)
+            seen.insert(rule.id)
+            rules[index] = rule
+            changed = true
+        }
+        return changed
     }
 
     private func save() {
