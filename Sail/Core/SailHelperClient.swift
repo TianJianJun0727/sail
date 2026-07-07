@@ -35,6 +35,25 @@ enum SailHelperClient {
         (await request(["cmd": "stop"]))?["ok"] as? Bool == true
     }
 
+    /// TUN 模式启动前，让 helper 保存原系统 DNS 并把 macOS DNS 指向 TUN 可劫持地址。
+    /// 返回保存下来的原 DNS，用于生成 sing-box 运行配置里的 bootstrap/direct DNS，避免 local 递归。
+    static func prepareTunDNS(address: String) async -> (Bool, [String], String?) {
+        guard let r = await request(["cmd": "prepare-tun-dns", "address": address]) else {
+            return (false, [], "无法连接 helper")
+        }
+        let ok = r["ok"] as? Bool == true
+        let servers = r["servers"] as? [String] ?? []
+        return (ok, servers, r["error"] as? String)
+    }
+
+    static func restoreDNS() async -> Bool {
+        (await request(["cmd": "restore-dns"]))?["ok"] as? Bool == true
+    }
+
+    static func restoreDNSSync() -> Bool {
+        sendSync(["cmd": "restore-dns"])?["ok"] as? Bool == true
+    }
+
     /// 同步停内核：仅供 app 退出收尾（applicationWillTerminate 不能 await，可短暂阻塞）。
     /// 在调用线程做一次带 6s 超时的 socket 往返，确保 root TUN 内核被停掉。
     static func stopKernelSync() {

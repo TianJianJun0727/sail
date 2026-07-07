@@ -7,12 +7,13 @@
 import Foundation
 import os
 
-let kHelperVersion = "6"   // helper 自身版本：改 helper 行为时 +1，app 据此判旧并自动重装（6：stop 兜底扫掉 root 内核孤儿）
+let kHelperVersion = "7"   // helper 自身版本：改 helper 行为时 +1，app 据此判旧并自动重装（7：TUN 模式接管/恢复系统 DNS）
 let kSocketPath = "/var/run/com.unreadcode.Sail.helper.sock"
 let kSupportDir = "/Library/Application Support/Sail"
 let kSingBoxPath = kSupportDir + "/sing-box"      // root 所有的可信副本
 let kConfigPath  = kSupportDir + "/config.run.json"
 let kLogPath     = kSupportDir + "/kernel.log"    // 内核输出（0644，app 端 tail 读）
+let kDNSBackupPath = kSupportDir + "/dns.backup.json"
 let kLogMaxBytes: Int64 = 5 << 20                 // 单文件超过 5MB 即轮转（rename 到 .1，重开新文件）
 
 // 允许的调用方 uid，由 plist 的 --uid 传入
@@ -31,6 +32,31 @@ func storePID(_ p: pid_t) { pidLock.withLock { $0 = p } }
 func clearPID(ifEqual expected: pid_t) { pidLock.withLock { if $0 == expected { $0 = 0 } } }
 
 func elog(_ s: String) { FileHandle.standardError.write(Data(("sail-helper: " + s + "\n").utf8)) }
+
+func jsonLine(_ object: [String: Any]) -> String {
+    guard let data = try? JSONSerialization.data(withJSONObject: object),
+          let text = String(data: data, encoding: .utf8) else {
+        return "{\"ok\":false,\"error\":\"json encode failed\"}\n"
+    }
+    return text + "\n"
+}
+
+func runCommand(_ path: String, _ args: [String]) -> (Int32, String) {
+    let pipe = Pipe()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = args
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return (-1, error.localizedDescription)
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+}
 
 func setCloseOnExec(_ fd: Int32, _ name: String) -> Bool {
     guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
@@ -137,7 +163,7 @@ func sweepStrayRootKernels() {
 
 /// 停内核：先停跟踪到的 pid（SIGTERM 优雅退出，保 TUN 路由正常拆除），再兜底扫掉任何未跟踪的 root 内核孤儿。
 /// 阻塞的等待循环不在锁内，故不会卡住看门狗或其它命令。
-func stopSingBox() {
+func stopSingBox(restoreDNS: Bool = true) {
     let pid = loadPID()
     if pid > 0 {
         kill(pid, SIGTERM)
@@ -148,6 +174,99 @@ func stopSingBox() {
         clearPID(ifEqual: pid)
     }
     sweepStrayRootKernels()   // 兜底：pid 跟踪不到的孤儿（helper 重装/重启遗留）也清掉，否则它一直占 7890
+    if restoreDNS { restoreSystemDNS() }
+}
+
+// MARK: TUN DNS 接管 / 恢复
+
+func networkServices() -> [String] {
+    let (status, output) = runCommand("/usr/sbin/networksetup", ["-listallnetworkservices"])
+    guard status == 0 else {
+        elog("读取网络服务失败：\(output)")
+        return []
+    }
+    return output
+        .split(whereSeparator: \.isNewline)
+        .dropFirst()
+        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty && !$0.hasPrefix("*") }
+}
+
+func dnsServers(for service: String) -> [String] {
+    let (status, output) = runCommand("/usr/sbin/networksetup", ["-getdnsservers", service])
+    guard status == 0 else { return [] }
+    let lines = output
+        .split(whereSeparator: \.isNewline)
+        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    if lines.count == 1, lines[0].hasPrefix("There aren't any DNS Servers") { return [] }
+    return lines.filter { !$0.hasPrefix("** Error:") }
+}
+
+func currentDNSBackup() -> [[String: Any]] {
+    networkServices().map { service in
+        ["service": service, "servers": dnsServers(for: service)]
+    }
+}
+
+func flattenedDNSServers(_ backup: [[String: Any]]) -> [String] {
+    var seen = Set<String>()
+    var result: [String] = []
+    for item in backup {
+        guard let servers = item["servers"] as? [String] else { continue }
+        for server in servers where !seen.contains(server) {
+            seen.insert(server)
+            result.append(server)
+        }
+    }
+    return result
+}
+
+func readDNSBackup() -> [[String: Any]]? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: kDNSBackupPath)),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+        return nil
+    }
+    return object
+}
+
+func writeDNSBackup(_ backup: [[String: Any]]) {
+    try? FileManager.default.createDirectory(atPath: kSupportDir, withIntermediateDirectories: true)
+    guard let data = try? JSONSerialization.data(withJSONObject: backup, options: [.prettyPrinted]) else { return }
+    try? data.write(to: URL(fileURLWithPath: kDNSBackupPath), options: .atomic)
+    chown(kDNSBackupPath, 0, 0)
+    chmod(kDNSBackupPath, 0o600)
+}
+
+func prepareTunDNS(_ address: String) -> (Bool, [String], String) {
+    guard !address.isEmpty else { return (false, [], "empty dns address") }
+    let backup = readDNSBackup() ?? currentDNSBackup()
+    if !FileManager.default.fileExists(atPath: kDNSBackupPath) {
+        writeDNSBackup(backup)
+    }
+    var errors: [String] = []
+    for item in backup {
+        guard let service = item["service"] as? String else { continue }
+        let (status, output) = runCommand("/usr/sbin/networksetup", ["-setdnsservers", service, address])
+        if status != 0 {
+            errors.append("\(service): \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+    }
+    return (errors.isEmpty, flattenedDNSServers(backup), errors.joined(separator: "; "))
+}
+
+func restoreSystemDNS() {
+    guard let backup = readDNSBackup() else { return }
+    for item in backup {
+        guard let service = item["service"] as? String,
+              let servers = item["servers"] as? [String] else { continue }
+        let args = ["-setdnsservers", service] + (servers.isEmpty ? ["Empty"] : servers)
+        let (status, output) = runCommand("/usr/sbin/networksetup", args)
+        if status != 0 {
+            elog("恢复 DNS 失败(\(service))：\(output)")
+        }
+    }
+    try? FileManager.default.removeItem(atPath: kDNSBackupPath)
 }
 
 func startSingBox(_ configJSON: String) -> (Bool, String) {
@@ -162,7 +281,7 @@ func startSingBox(_ configJSON: String) -> (Bool, String) {
     }
     chown(kConfigPath, 0, 0); chmod(kConfigPath, 0o600)
 
-    stopSingBox()
+    stopSingBox(restoreDNS: false)
 
     // 内核 stdout/stderr 接管道，由 helper 独占写日志（避免「内核 + helper 同时写一个文件」的截断 race）。
     var fds: [Int32] = [0, 0]
@@ -227,7 +346,16 @@ func handle(_ line: String) -> String {
         return "{\"ok\":true,\"running\":\(running)}\n"
     case "stop":
         stopSingBox()
-        return "{\"ok\":true}\n"
+        return jsonLine(["ok": true])
+    case "prepare-tun-dns":
+        let address = obj["address"] as? String ?? ""
+        let (ok, servers, err) = prepareTunDNS(address)
+        var response: [String: Any] = ["ok": ok, "servers": servers]
+        if !ok { response["error"] = err }
+        return jsonLine(response)
+    case "restore-dns":
+        restoreSystemDNS()
+        return jsonLine(["ok": true])
     case "start":
         let cfg = obj["config"] as? String ?? ""
         guard !cfg.isEmpty else { return "{\"ok\":false,\"error\":\"empty config\"}\n" }

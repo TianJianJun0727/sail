@@ -30,6 +30,7 @@ final class KernelRunner {
     private var ranViaHelper = false   // 本次内核是否由特权 helper(root) 启动（TUN 模式）
     private var helperStaleChecked = false   // 本会话是否已做过 helper 过期检查（只做一次，免重复弹授权）
     private var lastAppliedConfig: String?   // 上次成功启动所用配置（归一化 JSON）；用于「无变化跳过重启」
+    private var tunOriginalDNSServers: [String] = []   // helper 接管系统 DNS 前保存的原 DNS，避免 local DNS 递归
     private let maxLogLines = 2000
 
     // 内核异常退出后的自动重启：限次 + 退避，避免坏配置导致的无限快速重启循环
@@ -182,10 +183,19 @@ final class KernelRunner {
         do {
             if useHelper {
                 // helper 模式：配置交给 root helper 起 sing-box（TUN 需要 root，本进程不持有内核进程）
+                let (dnsOK, originalDNS, dnsError) = await SailHelperClient.prepareTunDNS(address: Self.tunDNSAddress)
+                tunOriginalDNSServers = originalDNS
+                if dnsOK {
+                    appendLogs(["[TUN] 系统 DNS 已临时指向 \(Self.tunDNSAddress)，原 DNS：\(originalDNS.isEmpty ? "空" : originalDNS.joined(separator: ", "))"])
+                } else {
+                    appendLogs(["[TUN] ⚠️ 接管系统 DNS 失败：\(dnsError ?? "未知错误")"])
+                }
                 let config = makeConfig()
                 let data = try JSONSerialization.data(withJSONObject: config)
                 let (ok, err) = await SailHelperClient.startKernel(config: String(decoding: data, as: UTF8.self))
                 guard ok else {
+                    _ = await SailHelperClient.restoreDNS()
+                    tunOriginalDNSServers.removeAll()
                     let reason = err ?? "helper 启动失败"
                     appendLogs(["[TUN] helper 启动内核失败：\(reason)"])
                     throw KernelError.message("TUN 启动失败：\(reason)")
@@ -354,6 +364,8 @@ final class KernelRunner {
             guard runState == .running || runState == .starting else { return }
             runState = .stopping
             _ = await SailHelperClient.stopKernel()
+            _ = await SailHelperClient.restoreDNS()
+            tunOriginalDNSServers.removeAll()
             ranViaHelper = false
             startedAt = nil
             runState = .stopped
@@ -409,6 +421,7 @@ final class KernelRunner {
             // helper 模式：同步停掉 root 起的内核，否则退出后残留 root TUN 占路由表 → 整机断网
             if ranViaHelper {
                 SailHelperClient.stopKernelSync()
+                _ = SailHelperClient.restoreDNSSync()
                 return
             }
             guard let proc = process, proc.isRunning else { return }
@@ -590,6 +603,7 @@ final class KernelRunner {
 
     private static let geositeCN = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
     private static let geoipCN = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+    private static let tunDNSAddress = "172.18.0.2"
 
     /// 生成运行配置：mixed 入站 + 出站 + 按模式路由。
     /// 出站永远是「每节点独立出站 + 分组（机场自带 proxy-groups 或合成的 Proxy/Auto）」，与路由模式解耦
@@ -731,21 +745,36 @@ final class KernelRunner {
         // DNS 解析策略：sing-box 全局配置，所有模式生效（默认 ipv4_only）。
         // TUN 通告 IPv6 后 macOS 会优先走 IPv6，但直连/代理常无可用 IPv6 出口 →
         // 连上却无数据；ipv4_only 只给 IPv4 可规避，需要 IPv6 的用户可改 prefer_*。
+        let originalSystemDNSServer = tunOriginalDNSServers.first {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0 != Self.tunDNSAddress
+        }
+        func dnsServer(provider: DNSProvider, tag: String, detour: String? = nil, domainResolver: String? = "bootstrap") -> [String: Any] {
+            if provider == .system, isTun, settings.tun.dnsHijack, let originalSystemDNSServer {
+                return [
+                    "tag": tag,
+                    "type": "udp",
+                    "server": originalSystemDNSServer,
+                    "server_port": 53,
+                    "detour": "direct",
+                ]
+            }
+            return provider.server(tag: tag, detour: detour, domainResolver: domainResolver)
+        }
         var dnsServers: [[String: Any]] = []
         if settings.bootstrapDNSProvider == .system {
-            dnsServers.append(["tag": "bootstrap", "type": "local"])
+            dnsServers.append(dnsServer(provider: .system, tag: "bootstrap", domainResolver: nil))
         } else {
-            dnsServers.append(["tag": "bootstrap-local", "type": "local"])
-            dnsServers.append(settings.bootstrapDNSProvider.server(tag: "bootstrap", domainResolver: "bootstrap-local"))
+            dnsServers.append(dnsServer(provider: .system, tag: "bootstrap-local", domainResolver: nil))
+            dnsServers.append(dnsServer(provider: settings.bootstrapDNSProvider, tag: "bootstrap", domainResolver: "bootstrap-local"))
         }
         let remoteDetour = (isTun && settings.tun.dnsHijack && hasProxy && settings.remoteDNSProvider != .system) ? proxyTag : nil
-        dnsServers.append(settings.remoteDNSProvider.server(tag: "remote-dns", detour: remoteDetour))
-        dnsServers.append(settings.directDNSProvider.server(tag: "direct-dns"))
+        dnsServers.append(dnsServer(provider: settings.remoteDNSProvider, tag: "remote-dns", detour: remoteDetour))
+        dnsServers.append(dnsServer(provider: settings.directDNSProvider, tag: "direct-dns"))
 
         var dnsRules: [[String: Any]] = []
         for (index, rule) in settings.domainDNSRules.enumerated() {
             let tag = "domain-rule-dns-\(index + 1)"
-            dnsServers.append(rule.provider.server(tag: tag))
+            dnsServers.append(dnsServer(provider: rule.provider, tag: tag))
             dnsRules.append(["domain_regex": rule.regexes, "server": tag])
         }
 
