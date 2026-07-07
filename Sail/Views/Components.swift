@@ -43,3 +43,50 @@ struct SectionHeader<Trailing: View>: View {
         }
     }
 }
+
+private enum PageTopBarMetrics {
+    static let height: CGFloat = 50
+    static let horizontalPadding: CGFloat = 24
+}
+
+extension View {
+    /// 页面标题下方的第一行工具区，统一各页的高度和左右边距。
+    func pageTopBar(alignment: Alignment = .center) -> some View {
+        self
+            .padding(.horizontal, PageTopBarMetrics.horizontalPadding)
+            .frame(maxWidth: .infinity, minHeight: PageTopBarMetrics.height,
+                   maxHeight: PageTopBarMetrics.height, alignment: alignment)
+    }
+
+    /// 为无效输入添加红色边框
+    func invalidInputBorder(_ invalid: Bool) -> some View {
+        overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(invalid ? Color.red.opacity(0.75) : Color.clear, lineWidth: 1)
+        )
+    }
+}
+
+/// 表单字段错误提示
+struct FieldError: View {
+    var text: String?
+
+    var body: some View {
+        if let text {
+            Label(text, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - 集合扩展
+
+extension Array where Element: Hashable {
+    /// 去重保序：返回去除重复元素后的数组，保持首次出现的顺序
+    func uniqued() -> [Element] {
+        var seen = Set<Element>()
+        return filter { seen.insert($0).inserted }
+    }
+}

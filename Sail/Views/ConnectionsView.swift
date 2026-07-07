@@ -77,7 +77,7 @@ struct ConnectionsView: View {
             .background(Color(nsColor: .quaternaryLabelColor).opacity(0.4), in: Capsule())
             .frame(maxWidth: 300)
         }
-        .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 14)
+        .pageTopBar(alignment: .center)
     }
 
     private var list: some View {

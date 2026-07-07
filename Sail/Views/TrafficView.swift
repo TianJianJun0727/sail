@@ -60,7 +60,7 @@ struct TrafficView: View {
             }
             .controlSize(.small).disabled(data.isEmpty)
         }
-        .padding(.horizontal, 20).padding(.vertical, 12)
+        .pageTopBar()
     }
 
     private var list: some View {

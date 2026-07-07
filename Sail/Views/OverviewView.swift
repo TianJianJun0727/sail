@@ -227,11 +227,13 @@ struct OverviewView: View {
             get: { activeGroup?.name ?? "" },
             set: { pickedGroup = $0 }
         )) {
-            ForEach(groups) { g in Text(g.name).tag(g.name) }
+            ForEach(groups) { group in
+                Text(group.name).tag(group.name)
+            }
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 200, alignment: .leading)   // 左对齐，与下方节点框左边对齐，不居中
+        .frame(width: 200, alignment: .leading)
     }
 
     /// 节点选择（独立框）：左侧菜单选节点（展开每项后带延迟），右侧延迟/测速（hover 高亮、点击测速、转圈占位）。
@@ -242,14 +244,18 @@ struct OverviewView: View {
         HStack(spacing: 0) {
             Button { if group != nil { showNodes.toggle() } } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "antenna.radiowaves.left.and.right").font(.system(size: 15)).foregroundStyle(Color.accentColor)
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
                     Text(group?.now.isEmpty == false ? group!.now : "未选择节点")
-                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
                         .foregroundStyle(.primary)
-                        .lineLimit(1).truncationMode(.middle).frame(maxWidth: 190, alignment: .leading)
-                    Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle).frame(maxWidth: 185, alignment: .leading)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
                 }
-                .padding(.leading, 16).padding(.trailing, 10).padding(.vertical, 9)
+                .padding(.leading, 12).padding(.trailing, 9).padding(.vertical, 8)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -258,7 +264,7 @@ struct OverviewView: View {
                 if let group { nodePopover(group) }
             }
 
-            Divider().frame(height: 26)
+            Divider().frame(height: 24)
 
             DelayPill(delay: nowDelay, testing: testing, enabled: groupStore.live,
                       color: groupLatencyColor(nowDelay)) {
@@ -266,8 +272,12 @@ struct OverviewView: View {
             }
         }
         .fixedSize()   // 按内容收缩，永不超出父容器
-        .background(Color.accentColor.opacity(0.08))
+        .background(Color(nsColor: .quaternaryLabelColor).opacity(0.25))
         .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(0.14), lineWidth: 1)
+        )
     }
 
     /// 节点选择 popover：限高 + 可滚动，节点再多也不会撑满屏幕。
