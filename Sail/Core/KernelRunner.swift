@@ -305,18 +305,27 @@ final class KernelRunner {
     }
 
     /// 从 app 包内置的二进制把内核播种 / 刷新到工作目录（离线可用）。
-    /// 内核不在 App 内联网更新，改为「随新版 App 内置的二进制」分发：同一 App 版本只播种一次，
-    /// App 版本一变（升级/降级）就用内置副本覆盖刷新，保证用户态内核始终 = 当前 App 内置的那份。
+    /// 内核不在 App 内联网更新，改为「随新版 App 内置的二进制」分发：用户态内核版本与内置版本不一致时覆盖刷新。
+    /// 不能只用 App 版本号做缓存；同一 App 版本下测试不同内核分支时，也必须同步用户态副本。
     /// 读不出内置二进制时不动已装内核（dev 构建漏跑 fetch-kernel.sh 不至于把内核误删）。
     nonisolated static func seedKernelFromBundleIfNeeded() {
         guard let bundled = Bundle.main.url(forResource: "sing-box", withExtension: nil) else { return }
         let dest = KernelPaths.binary
         let exists = FileManager.default.fileExists(atPath: dest.path)
 
-        // 用 App 版本号当「内核可能变了」的廉价信号（内核只随发版变），免得每次重启都跑两次 `version` 子进程比对。
         let appVer = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
         let key = "seededKernelAppVersion"
-        if exists, UserDefaults.standard.string(forKey: key) == appVer { return }
+        if exists {
+            let bundledVersion = SystemInfo.kernelVersion(at: bundled.path)
+            let installedVersion = SystemInfo.kernelVersion(at: dest.path)
+            if let bundledVersion, installedVersion == bundledVersion {
+                UserDefaults.standard.set(appVer, forKey: key)
+                return
+            }
+            if bundledVersion == nil, UserDefaults.standard.string(forKey: key) == appVer {
+                return
+            }
+        }
 
         do {
             try FileManager.default.createDirectory(at: KernelPaths.kernelDir, withIntermediateDirectories: true)
