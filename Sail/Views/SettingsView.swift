@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// 设置页面：应用常规偏好（持久化到 SettingsStore）。顶部 Tab 切换分区，避免单页过长。
@@ -44,7 +45,8 @@ struct SettingsView: View {
                 }
                 .frame(maxWidth: 720)
                 .frame(maxWidth: .infinity)
-                .padding(24)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 24)
             }
             .scrollIndicators(.hidden)
         }
@@ -88,8 +90,59 @@ struct SettingsView: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .pageTopBar()
+    }
+}
+
+private extension Notification.Name {
+    static let settingsTextInputShouldResign = Notification.Name("settingsTextInputShouldResign")
+}
+
+private extension View {
+    func resignTextInputFocusOnOutsideClick() -> some View {
+        modifier(ResignTextInputFocusOnOutsideClick())
+    }
+}
+
+private struct ResignTextInputFocusOnOutsideClick: ViewModifier {
+    @State private var monitor: Any?
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear(perform: install)
+            .onDisappear(perform: remove)
+    }
+
+    private func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { event in
+            guard let window = event.window,
+                  window == NSApp.keyWindow,
+                  let contentView = window.contentView else { return event }
+            let hitView = contentView.hitTest(event.locationInWindow)
+            guard hitView?.isTextInputOrDescendant != true else { return event }
+            NotificationCenter.default.post(name: .settingsTextInputShouldResign, object: nil)
+            window.makeFirstResponder(nil)
+            return event
+        }
+    }
+
+    private func remove() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        monitor = nil
+    }
+}
+
+private extension NSView {
+    var isTextInputOrDescendant: Bool {
+        var view: NSView? = self
+        while let current = view {
+            if current is NSTextField || current is NSTextView { return true }
+            view = current.superview
+        }
+        return false
     }
 }
 
@@ -144,14 +197,34 @@ private struct GeneralCard: View {
 
 // MARK: - sing-box（内核运行配置）
 
+private struct DomainDNSRuleDraft: Identifiable, Equatable {
+    var id = UUID()
+    var provider: DNSProvider = .system
+    var suffixText = ""
+
+    nonisolated init() {}
+
+    nonisolated init(rule: DomainDNSRule) {
+        id = rule.id
+        provider = rule.provider
+        suffixText = rule.patterns.isEmpty
+            ? (rule.suffixes + rule.regexes.map { "regex:\($0)" }).joined(separator: ", ")
+            : rule.patterns.joined(separator: ", ")
+    }
+}
+
 private struct SingBoxCard: View {
     @State private var store = SettingsStore.shared
     @State private var geo = GeoData.shared
     @State private var portText = ""
+    @State private var portError: String?
+    @State private var domainRuleDrafts: [DomainDNSRuleDraft] = []
+    @State private var domainRuleErrorsByID: [UUID: String] = [:]
     @State private var tunGranted = false
     @State private var tunBusy = false
     @State private var showingTUN = false
     @FocusState private var portFocused: Bool
+    @FocusState private var focusedDomainRuleID: UUID?
     private let dnsStrategyLabels = ["ipv4_only": "仅 IPv4", "prefer_ipv4": "优先 IPv4", "prefer_ipv6": "优先 IPv6"]
 
     private static let dateFmt: DateFormatter = {
@@ -167,23 +240,40 @@ private struct SingBoxCard: View {
         Card(padding: 0) {
             VStack(spacing: 0) {
                 settingRow("混合代理端口", "HTTP / SOCKS 共用的本地监听端口（重启内核后生效）") {
-                    TextField("", text: $portText)
-                        .textFieldStyle(.roundedBorder)
-                        .multilineTextAlignment(.trailing)
-                        .font(.system(size: 13, design: .monospaced))
-                        .frame(width: 90)
-                        .focused($portFocused)
-                        .onChange(of: portText) { _, new in
-                            portText = String(new.filter(\.isNumber).prefix(5))
-                        }
-                        .onSubmit(commitPort)
-                        .onChange(of: portFocused) { _, focused in if !focused { commitPort() } }
-                        .onChange(of: store.mixedPort) { _, v in portText = String(v) }
+                    VStack(alignment: .trailing, spacing: 4) {
+                        TextField("", text: $portText)
+                            .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.trailing)
+                            .font(.system(size: 13, design: .monospaced))
+                            .frame(width: 90)
+                            .focused($portFocused)
+                            .onChange(of: portText) { _, new in
+                                let filtered = String(new.filter(\.isNumber).prefix(5))
+                                if filtered != new { portText = filtered }
+                                portError = nil
+                            }
+                            .invalidInputBorder(portError != nil)
+                            .onSubmit(commitPort)
+                            .onChange(of: portFocused) { old, new in
+                                if old && !new { commitPort() }
+                            }
+                            .onChange(of: store.mixedPort) { _, v in
+                                if !portFocused { portText = String(v) }
+                            }
+                        FieldError(text: portError)
+                    }
                 }
                 Divider().padding(.leading, 16)
                 settingRow("允许局域网连接", "让同一网络下的其它设备使用此代理") {
                     Toggle("", isOn: Binding(get: { store.allowLan }, set: { store.setAllowLan($0) }))
                         .labelsHidden().toggleStyle(.switch)
+                }
+                Divider().padding(.leading, 16)
+                settingRow("内核日志级别", "控制 sing-box 输出日志的详细程度；调试 / 跟踪会产生更多日志") {
+                    Picker("", selection: Binding(get: { store.kernelLogLevel }, set: { store.setKernelLogLevel($0) })) {
+                        ForEach(KernelLogLevel.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().fixedSize()
                 }
                 Divider().padding(.leading, 16)
                 settingRow("DNS 解析策略", "仅 IPv4 最稳；无可用 IPv6 出口时选它，可避免连上却打不开") {
@@ -192,6 +282,91 @@ private struct SingBoxCard: View {
                     }
                     .pickerStyle(.segmented).labelsHidden().fixedSize()
                 }
+                Divider().padding(.leading, 16)
+                settingRow("远程 DNS", "默认解析使用的 DNS；TUN 劫持且有代理节点时会跟随代理出站，减少污染和泄漏") {
+                    Picker("", selection: Binding(get: { store.remoteDNSProvider }, set: { store.setRemoteDNSProvider($0) })) {
+                        ForEach(DNSProvider.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().fixedSize()
+                }
+                Divider().padding(.leading, 16)
+                settingRow("直连 DNS", "国内规则或直连场景使用的 DNS；默认系统 DNS，适合获取本地运营商解析结果") {
+                    Picker("", selection: Binding(get: { store.directDNSProvider }, set: { store.setDirectDNSProvider($0) })) {
+                        ForEach(DNSProvider.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().fixedSize()
+                }
+                Divider().padding(.leading, 16)
+                settingRow("引导 DNS", "用于解析 DNS 服务器域名和节点域名；必须使用系统 DNS 或 UDP DNS，不能使用 DoH（避免循环依赖）") {
+                    Picker("", selection: Binding(get: { store.bootstrapDNSProvider }, set: { store.setBootstrapDNSProvider($0) })) {
+                        ForEach(DNSProvider.allCases.filter(\.isBootstrapSafe)) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.menu).labelsHidden().fixedSize()
+                }
+                Divider().padding(.leading, 16)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("指定域名 DNS").font(.system(size: 13, weight: .medium))
+                            Text("每组选择一个 DNS，并填写多个域名匹配；支持 example.com、*.example.com、+.example.com、regex:...，多个用逗号分隔")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                        Button {
+                            domainRuleDrafts.append(DomainDNSRuleDraft())
+                        } label: {
+                            Label("新增", systemImage: "plus")
+                        }
+                        .controlSize(.small)
+                        Button("应用") { commitDomainRules() }.controlSize(.small)
+                    }
+
+                    if domainRuleDrafts.isEmpty {
+                        Text("暂无指定域名 DNS 规则")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 6)
+                    } else {
+                        ForEach(domainRuleDrafts) { draft in
+                            let ruleID = draft.id
+                            HStack(alignment: .top, spacing: 8) {
+                                Picker("", selection: providerBinding(for: ruleID)) {
+                                    ForEach(DNSProvider.allCases) { Text($0.label).tag($0) }
+                                }
+                                .pickerStyle(.menu)
+                                .labelsHidden()
+                                .frame(width: 120)
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    TextField("example.com, internal.example.com", text: suffixTextBinding(for: ruleID))
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .invalidInputBorder(domainRuleErrorsByID[ruleID] != nil)
+                                        .focused($focusedDomainRuleID, equals: ruleID)
+                                        .onChange(of: draft.suffixText) { _, _ in
+                                            domainRuleErrorsByID.removeValue(forKey: ruleID)
+                                        }
+                                        .onChange(of: draft.provider) { _, _ in
+                                            domainRuleErrorsByID.removeValue(forKey: ruleID)
+                                        }
+                                    FieldError(text: domainRuleErrorsByID[ruleID])
+                                }
+
+                                Button {
+                                    deleteDomainRule(ruleID)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.secondary)
+                                .help("删除")
+                            }
+                        }
+                    }
+                }
+                .padding(16)
                 Divider().padding(.leading, 16)
                 settingRow("GEO 数据", geoDesc) {
                     if geo.updating {
@@ -225,16 +400,99 @@ private struct SingBoxCard: View {
         }
         .onAppear {
             portText = String(store.mixedPort)
+            domainRuleDrafts = store.domainDNSRules.map(DomainDNSRuleDraft.init(rule:))
             tunGranted = HelperManager.isInstalled
         }
+        .onDisappear {
+            commitPort()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .settingsTextInputShouldResign)) { _ in
+            portFocused = false
+            focusedDomainRuleID = nil
+        }
+        .resignTextInputFocusOnOutsideClick()
         .sheet(isPresented: $showingTUN) {
             TUNSettingsSheet(config: store.tun) { store.setTUN($0) }
         }
     }
 
     private func commitPort() {
-        store.setMixedPort(Int(portText) ?? SettingsStore.defaultPort)
+        guard let port = Int(portText), (1...65535).contains(port) else {
+            portError = "端口需为 1-65535 的数字"
+            return
+        }
+        store.setMixedPort(port)
         portText = String(store.mixedPort)
+        portError = nil
+    }
+
+    private func commitDomainRules() {
+        guard let rules = validatedDomainRuleDrafts(updateErrorState: true) else { return }
+        // 直接设置已验证的规则，跳过 normalizedDomainDNSRules 的重复验证
+        store.setDomainDNSRulesDirectly(rules)
+        domainRuleDrafts = store.domainDNSRules.map(DomainDNSRuleDraft.init(rule:))
+        domainRuleErrorsByID = [:]
+    }
+
+    private func validatedDomainRuleDrafts(updateErrorState: Bool) -> [DomainDNSRule]? {
+        var errors: [UUID: String] = [:]
+        var rules: [DomainDNSRule] = []
+        for draft in domainRuleDrafts {
+            let text = draft.suffixText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                errors[draft.id] = "不能为空"
+                continue
+            }
+            let validation = SettingsStore.validatedDomainMatchers([draft.suffixText])
+            guard validation.isValid else {
+                let invalid = validation.invalid.isEmpty ? [draft.suffixText] : validation.invalid
+                errors[draft.id] = "格式无效：\(invalid.prefix(3).joined(separator: ", "))"
+                continue
+            }
+            var rule = DomainDNSRule()
+            rule.id = draft.id
+            rule.provider = draft.provider
+            rule.patterns = validation.patterns
+            rule.suffixes = []  // 已合并到 regexes
+            rule.regexes = validation.regexes
+            rules.append(rule)
+        }
+        guard errors.isEmpty else {
+            if updateErrorState {
+                domainRuleErrorsByID = errors
+            }
+            return nil
+        }
+        if updateErrorState {
+            domainRuleErrorsByID = [:]
+        }
+        return rules
+    }
+
+    private func deleteDomainRule(_ id: UUID) {
+        if focusedDomainRuleID == id {
+            focusedDomainRuleID = nil
+        }
+        domainRuleDrafts.removeAll { $0.id == id }
+        domainRuleErrorsByID.removeValue(forKey: id)
+    }
+
+    private func providerBinding(for id: UUID) -> Binding<DNSProvider> {
+        Binding {
+            domainRuleDrafts.first { $0.id == id }?.provider ?? .system
+        } set: { provider in
+            guard let index = domainRuleDrafts.firstIndex(where: { $0.id == id }) else { return }
+            domainRuleDrafts[index].provider = provider
+        }
+    }
+
+    private func suffixTextBinding(for id: UUID) -> Binding<String> {
+        Binding {
+            domainRuleDrafts.first { $0.id == id }?.suffixText ?? ""
+        } set: { text in
+            guard let index = domainRuleDrafts.firstIndex(where: { $0.id == id }) else { return }
+            domainRuleDrafts[index].suffixText = text
+        }
     }
 
     private func installTUNService() {
@@ -405,9 +663,13 @@ struct TUNSettingsSheet: View {
 private struct AdvancedCard: View {
     @State private var store = SettingsStore.shared
     @State private var timeoutText = ""
+    @State private var latencyURLText = ""
     @State private var intervalText = ""
+    @State private var timeoutError: String?
+    @State private var latencyURLError: String?
+    @State private var intervalError: String?
     @FocusState private var focus: Field?
-    private enum Field { case timeout, interval }
+    private enum Field { case timeout, url, interval }
 
     var body: some View {
         Card(padding: 0) {
@@ -418,16 +680,44 @@ private struct AdvancedCard: View {
                 }
                 Divider().padding(.leading, 16)
                 settingRow("延迟检测超时", "节点延迟测试的超时时间，默认 10000（单位毫秒）") {
-                    HStack(spacing: 4) {
-                        TextField("", text: $timeoutText)
-                            .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
-                            .font(.system(size: 13, design: .monospaced)).frame(width: 80)
-                            .focused($focus, equals: .timeout)
-                            .onChange(of: timeoutText) { _, n in timeoutText = String(n.filter(\.isNumber).prefix(5)) }
-                            .onSubmit(commitTimeout)
-                            .onChange(of: focus) { _, f in if f != .timeout { commitTimeout() } }
-                            .onChange(of: store.latencyTimeoutMs) { _, v in timeoutText = String(v) }
-                        Text("ms").font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .trailing, spacing: 4) {
+                        HStack(spacing: 4) {
+                            TextField("", text: $timeoutText)
+                                .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                                .font(.system(size: 13, design: .monospaced)).frame(width: 80)
+                                .focused($focus, equals: .timeout)
+                                .onChange(of: timeoutText) { _, n in
+                                    let filtered = String(n.filter(\.isNumber).prefix(5))
+                                    if filtered != n { timeoutText = filtered }
+                                    timeoutError = nil
+                                }
+                                .invalidInputBorder(timeoutError != nil)
+                                .onSubmit(commitTimeout)
+                                .onChange(of: focus) { _, f in if f != .timeout { commitTimeout() } }
+                                .onChange(of: store.latencyTimeoutMs) { _, v in
+                                    if focus != .timeout { timeoutText = String(v) }
+                                }
+                            Text("ms").font(.caption).foregroundStyle(.secondary)
+                        }
+                        FieldError(text: timeoutError)
+                    }
+                }
+                Divider().padding(.leading, 16)
+                settingRow("延迟检测 URL", "用于节点测速和自动组健康检查，需为 http/https URL") {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        TextField(SettingsStore.defaultLatencyTestURL, text: $latencyURLText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                            .frame(width: 280)
+                            .focused($focus, equals: .url)
+                            .invalidInputBorder(latencyURLError != nil)
+                            .onSubmit(commitLatencyURL)
+                            .onChange(of: latencyURLText) { _, _ in latencyURLError = nil }
+                            .onChange(of: focus) { _, f in if f != .url { commitLatencyURL() } }
+                            .onChange(of: store.latencyTestURL) { _, v in
+                                if focus != .url { latencyURLText = v }
+                            }
+                        FieldError(text: latencyURLError)
                     }
                 }
                 Divider().padding(.leading, 16)
@@ -437,16 +727,26 @@ private struct AdvancedCard: View {
                 }
                 Divider().padding(.leading, 16)
                 settingRow("延迟检测间隔", "自动检查的间隔，默认 300（单位秒）") {
-                    HStack(spacing: 4) {
-                        TextField("", text: $intervalText)
-                            .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
-                            .font(.system(size: 13, design: .monospaced)).frame(width: 80)
-                            .focused($focus, equals: .interval)
-                            .onChange(of: intervalText) { _, n in intervalText = String(n.filter(\.isNumber).prefix(4)) }
-                            .onSubmit(commitInterval)
-                            .onChange(of: focus) { _, f in if f != .interval { commitInterval() } }
-                            .onChange(of: store.latencyIntervalSec) { _, v in intervalText = String(v) }
-                        Text("秒").font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .trailing, spacing: 4) {
+                        HStack(spacing: 4) {
+                            TextField("", text: $intervalText)
+                                .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                                .font(.system(size: 13, design: .monospaced)).frame(width: 80)
+                                .focused($focus, equals: .interval)
+                                .onChange(of: intervalText) { _, n in
+                                    let filtered = String(n.filter(\.isNumber).prefix(4))
+                                    if filtered != n { intervalText = filtered }
+                                    intervalError = nil
+                                }
+                                .invalidInputBorder(intervalError != nil)
+                                .onSubmit(commitInterval)
+                                .onChange(of: focus) { _, f in if f != .interval { commitInterval() } }
+                                .onChange(of: store.latencyIntervalSec) { _, v in
+                                    if focus != .interval { intervalText = String(v) }
+                                }
+                            Text("秒").font(.caption).foregroundStyle(.secondary)
+                        }
+                        FieldError(text: intervalError)
                     }
                     .disabled(!store.autoLatencyCheck)
                 }
@@ -454,19 +754,50 @@ private struct AdvancedCard: View {
         }
         .onAppear {
             timeoutText = String(store.latencyTimeoutMs)
+            latencyURLText = store.latencyTestURL
             intervalText = String(store.latencyIntervalSec)
         }
+        .onDisappear {
+            commitTimeout()
+            commitLatencyURL()
+            commitInterval()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .settingsTextInputShouldResign)) { _ in
+            focus = nil
+        }
+        .resignTextInputFocusOnOutsideClick()
     }
 
     private func commitTimeout() {
-        store.setLatencyTimeout(Int(timeoutText) ?? 10000)
+        guard let timeout = Int(timeoutText), SettingsStore.validLatencyTimeoutRange.contains(timeout) else {
+            timeoutError = "超时时间需为 1000-60000 ms"
+            return
+        }
+        store.setLatencyTimeout(timeout)
         timeoutText = String(store.latencyTimeoutMs)
+        timeoutError = nil
+    }
+
+    private func commitLatencyURL() {
+        guard SettingsStore.validLatencyTestURL(latencyURLText) != nil else {
+            latencyURLError = "请输入有效的 http/https URL"
+            return
+        }
+        store.setLatencyTestURL(latencyURLText)
+        latencyURLText = store.latencyTestURL
+        latencyURLError = nil
     }
 
     private func commitInterval() {
-        store.setLatencyInterval(Int(intervalText) ?? 300)
+        guard let interval = Int(intervalText), SettingsStore.validLatencyIntervalRange.contains(interval) else {
+            intervalError = "检查间隔需为 10-3600 秒"
+            return
+        }
+        store.setLatencyInterval(interval)
         intervalText = String(store.latencyIntervalSec)
+        intervalError = nil
     }
+
 }
 
 // MARK: - Mixin 配置覆盖
@@ -521,6 +852,8 @@ private struct MixinCard: View {
                         .onChange(of: draft) { _, n in store.setText(n); checkResult = nil }
                     Text(#"例：{"dns":{"strategy":"prefer_ipv4"},"experimental":{"cache_file":{"enabled":true}}}"#)
                         .font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .textSelection(.enabled)
 
                     HStack(spacing: 10) {
@@ -562,7 +895,7 @@ private struct AboutCard: View {
     @State private var kernelVersion = ""   // 形如 v1.12.0；本地跑 `sing-box version` 取，不触网
 
     var body: some View {
-        Card {
+        Card(padding: 0) {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 12) {
                     Image("AppLogo")
@@ -577,6 +910,7 @@ private struct AboutCard: View {
                     Spacer()
                     Text(SystemInfo.appVersion).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
                 }
+                .padding(20)
 
                 VStack(spacing: 0) {
                     HStack {
@@ -641,6 +975,8 @@ private struct AboutCard: View {
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .strokeBorder(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 1)
                 )
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
             }
         }
         .task {

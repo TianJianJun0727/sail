@@ -1,71 +1,133 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
-/// 内核运行日志页面：实时展示 sing-box 输出，支持自动滚动、复制与清空。
+/// 内核运行日志页面：实时展示 sing-box 输出，支持自动滚动、复制、导出与清空。
 struct LogsView: View {
     private let runner = KernelRunner.shared
     @State private var minLevel: LogLevel = .all
-    @State private var atBottom = true   // 是否贴在底部：贴底才自动跟随尾巴，用户上滚后停止（避免把人拽回底部）
+    @State private var searchText = ""
+    @State private var atTop = true   // 最新日志在顶部：贴顶才自动跟随，用户下滚后停止（避免打断查看历史）
+    @State private var paused = false
+    @State private var pausedLogLines: [LogLine] = []
 
-    /// 日志级别过滤（最低级别：选中项及更高才显示）。
+    /// 日志级别过滤：选中具体级别时只显示该级别，不按严重度合并。
     enum LogLevel: Int, CaseIterable, Identifiable {
-        case all, info, warn, error
+        case all, trace, debug, info, warn, error, fatal, panic
         var id: Int { rawValue }
         var label: String {
             switch self {
             case .all: "全部"
+            case .trace: "跟踪"
+            case .debug: "调试"
             case .info: "信息"
             case .warn: "警告"
             case .error: "错误"
+            case .fatal: "致命"
+            case .panic: "崩溃"
             }
         }
-        /// 严重度阈值：行的严重度 >= 此值才显示。
-        var threshold: Int {
+        /// 级别编码：trace=1、debug=2、info=3、warn=4、error=5、fatal=6、panic=7。
+        var severity: Int {
             switch self {
             case .all: 0
-            case .info: 1
-            case .warn: 2
-            case .error: 3
+            case .trace: 1
+            case .debug: 2
+            case .info: 3
+            case .warn: 4
+            case .error: 5
+            case .fatal: 6
+            case .panic: 7
             }
         }
     }
 
-    /// 取一行日志的严重度：trace/debug=0、info=1、warn=2、error=3、fatal/panic=4。
-    /// sing-box 带时间戳的格式为 `+0800 2026-… 22:30:04 LEVEL …`，级别在第 4 段。
-    /// 行内显式级别 → 严重度；无法识别级别（多为 panic/error 的堆栈续行）返回 nil，由调用方决定继承。
+    /// 取一行日志的严重度：trace=1、debug=2、info=3、warn=4、error=5、fatal=6、panic=7。
+    /// sing-box 带时间戳的格式为 `+0800 2026-… 22:30:04 LEVEL …`；App 自己的方括号前缀日志默认按信息处理。
+    /// 内核堆栈续行通常没有独立级别，返回 nil 后由调用方继承上一行级别。
     static func explicitSeverity(of line: String) -> Int? {
         let clean = KernelRunner.stripANSI(line)
-        let fields = clean.split(separator: " ", omittingEmptySubsequences: true)
-        let token = fields.count > 3 ? fields[3].uppercased() : ""
+        if let severity = appSeverity(of: clean) { return severity }
+        let fields = clean.split(whereSeparator: \.isWhitespace).prefix(8)
+        for field in fields {
+            let token = field.trimmingCharacters(in: .punctuationCharacters).uppercased()
+            if let severity = severity(for: token) { return severity }
+        }
+        return nil
+    }
+
+    private static func severity(for token: String) -> Int? {
         switch token {
-        case "FATAL", "PANIC": return 4
-        case "ERROR": return 3
-        case "WARN", "WARNING": return 2
-        case "INFO": return 1
-        case "DEBUG", "TRACE": return 0
-        default:
-            if clean.contains("FATAL") || clean.contains(" ERROR") { return 3 }
-            if clean.contains(" WARN") { return 2 }
-            return nil
+        case "PANIC": return 7
+        case "FATAL": return 6
+        case "ERROR": return 5
+        case "WARN", "WARNING": return 4
+        case "INFO": return 3
+        case "DEBUG": return 2
+        case "TRACE": return 1
+        default: return nil
+        }
+    }
+
+    private static func appSeverity(of clean: String) -> Int? {
+        if clean.hasPrefix("[启动]") || clean.hasPrefix("[TUN]") || clean.hasPrefix("[监测]") {
+            if clean.contains("失败") || clean.contains("错误") || clean.contains("异常") {
+                return LogLevel.error.severity
+            }
+            if clean.contains("⚠️") || clean.contains("警告") {
+                return LogLevel.warn.severity
+            }
+            return LogLevel.info.severity
+        }
+        if clean == "配置无变化，跳过重启" { return LogLevel.info.severity }
+        return nil
+    }
+
+    private var visibleLogLines: [LogLine] {
+        paused ? pausedLogLines : runner.logLines
+    }
+
+    /// 暂停期间累积的新日志数量
+    private var newLogCountDuringPause: Int {
+        guard paused, let pausedLast = pausedLogLines.last else { return 0 }
+        return runner.logLines.filter { $0.id > pausedLast.id }.count
+    }
+
+    private var levelFiltered: [LogLine] {
+        guard minLevel != .all else { return visibleLogLines }
+        // 续行（无显式级别）继承上一行级别：否则 error 的多行堆栈会被当「信息」，筛「错误」时丢失关键细节。
+        var carried = LogLevel.info.severity
+        return visibleLogLines.filter { line in
+            let sev = Self.explicitSeverity(of: line.text) ?? carried
+            carried = sev
+            return sev == minLevel.severity
         }
     }
 
     private var filtered: [LogLine] {
-        guard minLevel != .all else { return runner.logLines }
-        // 续行（无显式级别）继承上一行级别：否则 error 的多行堆栈会被当「信息」，筛「错误」时丢失关键细节。
-        var carried = 1
-        return runner.logLines.filter { line in
-            let sev = Self.explicitSeverity(of: line.text) ?? carried
-            carried = sev
-            return sev >= minLevel.threshold
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return levelFiltered }
+        return levelFiltered.filter {
+            KernelRunner.stripANSI($0.text).localizedCaseInsensitiveContains(query)
         }
+    }
+
+    private var filterDescription: String {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            return "没有「\(minLevel.label)」级别的日志"
+        }
+        if minLevel == .all {
+            return "没有包含「\(query)」的日志"
+        }
+        return "没有「\(minLevel.label)」级别且包含「\(query)」的日志"
     }
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
             Divider()
-            if runner.logLines.isEmpty {
+            if visibleLogLines.isEmpty {
                 emptyState
             } else {
                 logScroll
@@ -85,12 +147,48 @@ struct LogsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text("·").foregroundStyle(.secondary)
-            Text(minLevel == .all ? "\(runner.logLines.count) 行"
-                                  : "\(filtered.count) / \(runner.logLines.count) 行")
+            Text(filtered.count == visibleLogLines.count ? "\(visibleLogLines.count) 行"
+                                                         : "\(filtered.count) / \(visibleLogLines.count) 行")
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
+            if paused {
+                Text("已暂停")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                if newLogCountDuringPause > 0 {
+                    Text("(\(newLogCountDuringPause) 条新日志)")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help("暂停期间有 \(newLogCountDuringPause) 条新日志，点击继续按钮查看")
+                }
+            }
 
             Spacer()
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                TextField("搜索", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("清除搜索")
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(width: 180, height: 26)
+            .background(Color(nsColor: .quaternaryLabelColor).opacity(0.45),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .help("搜索日志内容")
 
             Picker("", selection: $minLevel) {
                 ForEach(LogLevel.allCases) { Text($0.label).tag($0) }
@@ -98,52 +196,66 @@ struct LogsView: View {
             .pickerStyle(.menu)
             .labelsHidden()
             .fixedSize()
-            .help("按日志级别过滤（显示所选级别及更高）")
+            .help("按日志级别过滤（只显示所选级别）")
+
+            Button { togglePause() } label: {
+                Label(paused ? "继续" : "暂停", systemImage: paused ? "play.fill" : "pause.fill")
+            }
+            .disabled(runner.logLines.isEmpty && !paused)
+            .help(paused ? "继续刷新日志视图" : "暂停日志视图刷新")
 
             Button { copyAll() } label: {
                 Label("复制", systemImage: "doc.on.doc")
             }
-            .disabled(runner.logLines.isEmpty)
+            .disabled(filtered.isEmpty)
+
+            Button { exportAll() } label: {
+                Label("导出", systemImage: "square.and.arrow.up")
+            }
+            .disabled(filtered.isEmpty)
 
             Button { runner.clearLogs() } label: {
                 Label("清空", systemImage: "trash")
             }
             .disabled(runner.logLines.isEmpty)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .pageTopBar()
     }
 
-    // MARK: 日志列表（自动滚到底部）
+    private var displayed: [LogLine] {
+        filtered.reversed()
+    }
+
+    // MARK: 日志列表（最新在前，自动跟随顶部）
 
     private var logScroll: some View {
-        // 外层 GeometryReader 拿视口高度，喂给内层算「内容底边距视口底部的距离」→ 判断是否贴底。
-        GeometryReader { outer in
+        // 外层 GeometryReader 拿视口位置，喂给内层算「内容顶边距视口顶部的距离」→ 判断是否贴顶。
+        GeometryReader { _ in
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(filtered) { line in
+                        Color.clear.frame(height: 1).id("top")
+                        ForEach(displayed) { line in
                             Text(ANSI.attributed(line.text))
                                 .font(.system(size: 11.5, design: .monospaced))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        Color.clear.frame(height: 1).id("bottom")
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(
-                        // 内容底边在视口坐标系的 Y 减视口高 = 距底部的距离（贴底≈0，上滚为正）
+                        // 内容顶边在视口坐标系的 Y：贴顶≈0，下滚看历史时为负。
                         GeometryReader { inner in
                             Color.clear.preference(
-                                key: BottomDistanceKey.self,
-                                value: inner.frame(in: .named("logScroll")).maxY - outer.size.height
+                                key: TopDistanceKey.self,
+                                value: inner.frame(in: .named("logScroll")).minY
                             )
                         }
                     )
                     .overlay {
                         if filtered.isEmpty {
-                            Text("没有「\(minLevel.label)」级别的日志")
+                            Text(filterDescription)
                                 .font(.subheadline).foregroundStyle(.secondary)
                                 .padding(.top, 40)
                         }
@@ -152,28 +264,32 @@ struct LogsView: View {
                 .coordinateSpace(name: "logScroll")
                 .scrollIndicators(.hidden)
                 .background(Color(nsColor: .textBackgroundColor).opacity(0.35))
-                .onPreferenceChange(BottomDistanceKey.self) { dist in
-                    // 容差 ~40pt（约两三行）：吸收追加新行时的瞬时抖动，只有真正上滚才停跟随。
-                    atBottom = dist < 40
+                .onPreferenceChange(TopDistanceKey.self) { dist in
+                    // 容差 ~40pt（约两三行）：吸收追加新行时的瞬时抖动，只有真正下滚才停跟随。
+                    atTop = dist > -40
                 }
-                // 监听最后一行的 id 而非行数：日志封顶后行数恒为 800 不变，但新行仍在进来，用 last?.id 才能持续触底。
-                // 仅当用户停在底部时才跟随；上滚查看历史时不打扰。
+                // 监听最后一行的 id 而非行数：日志封顶后行数恒为 800 不变，但新行仍在进来，用 last?.id 才能持续跟随。
+                // 仅当用户停在顶部看最新日志时才跟随；下滚查看历史时不打扰。
                 .onChange(of: filtered.last?.id) {
-                    if atBottom { proxy.scrollTo("bottom", anchor: .bottom) }
+                    if atTop { proxy.scrollTo("top", anchor: .top) }
                 }
-                // 切换过滤级别：视作重新看，跳到底部并恢复跟随。
+                // 切换过滤级别：视作重新看，跳到顶部并恢复跟随。
                 .onChange(of: minLevel) {
-                    atBottom = true
-                    proxy.scrollTo("bottom", anchor: .bottom)
+                    atTop = true
+                    proxy.scrollTo("top", anchor: .top)
                 }
-                .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
-                .overlay(alignment: .bottomTrailing) {
-                    if !atBottom {
+                .onChange(of: searchText) {
+                    atTop = true
+                    proxy.scrollTo("top", anchor: .top)
+                }
+                .onAppear { proxy.scrollTo("top", anchor: .top) }
+                .overlay(alignment: .topTrailing) {
+                    if !atTop {
                         Button {
-                            atBottom = true
-                            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                            atTop = true
+                            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("top", anchor: .top) }
                         } label: {
-                            Image(systemName: "arrow.down")
+                            Image(systemName: "arrow.up")
                                 .font(.system(size: 12, weight: .bold))
                                 .foregroundStyle(.white)
                                 .frame(width: 30, height: 30)
@@ -182,11 +298,11 @@ struct LogsView: View {
                         }
                         .buttonStyle(.plain)
                         .padding(14)
-                        .help("回到底部并继续跟随")
+                        .help("回到最新日志并继续跟随")
                         .transition(.opacity.combined(with: .scale))
                     }
                 }
-                .animation(.easeOut(duration: 0.15), value: atBottom)
+                .animation(.easeOut(duration: 0.15), value: atTop)
             }
         }
     }
@@ -214,14 +330,54 @@ struct LogsView: View {
 
     private func copyAll() {
         // 复制时剥离颜色码，得到纯文本
-        let text = runner.logLines.map { KernelRunner.stripANSI($0.text) }.joined(separator: "\n")
+        let text = plainLogText()
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
+
+    private func exportAll() {
+        let panel = NSSavePanel()
+        panel.title = "导出日志"
+        panel.nameFieldStringValue = "sail-log-\(Self.exportTimestamp()).log"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try plainLogText().write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "导出日志失败"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+        }
+    }
+
+    private func plainLogText() -> String {
+        displayed.map { KernelRunner.stripANSI($0.text) }.joined(separator: "\n")
+    }
+
+    private func togglePause() {
+        if paused {
+            paused = false
+            pausedLogLines = []
+            atTop = true
+        } else {
+            pausedLogLines = runner.logLines
+            paused = true
+        }
+    }
+
+    private static func exportTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
+    }
 }
 
-/// 日志内容底边距视口底部的距离（贴底≈0，上滚为正），用于判断是否仍跟随尾巴。
-private struct BottomDistanceKey: PreferenceKey {
+/// 日志内容顶边距视口顶部的距离（贴顶≈0，下滚为负），用于判断是否仍跟随最新日志。
+private struct TopDistanceKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

@@ -30,7 +30,7 @@ final class KernelRunner {
     private var ranViaHelper = false   // 本次内核是否由特权 helper(root) 启动（TUN 模式）
     private var helperStaleChecked = false   // 本会话是否已做过 helper 过期检查（只做一次，免重复弹授权）
     private var lastAppliedConfig: String?   // 上次成功启动所用配置（归一化 JSON）；用于「无变化跳过重启」
-    private let maxLogLines = 800
+    private let maxLogLines = 2000
 
     // 内核异常退出后的自动重启：限次 + 退避，避免坏配置导致的无限快速重启循环
     private var crashCount = 0
@@ -543,6 +543,12 @@ final class KernelRunner {
         logLines.removeAll()
     }
 
+    private func trimLogs() {
+        if logLines.count > maxLogLines {
+            logLines.removeFirst(logLines.count - maxLogLines)
+        }
+    }
+
     private func appendLogs(_ lines: [String]) {
         // 保留原始 ANSI 颜色码，展示时由日志页解析上色；复制时再剥离
         // 每行带单调递增序号 id：跨 removeFirst（封顶裁剪）仍稳定，避免日志页用数组下标当 id 导致复用错位
@@ -550,9 +556,7 @@ final class KernelRunner {
             logLines.append(LogLine(id: logSeq, text: line))
             logSeq += 1
         }
-        if logLines.count > maxLogLines {
-            logLines.removeFirst(logLines.count - maxLogLines)
-        }
+        trimLogs()
     }
 
     /// 剥离 ANSI 颜色码（复制到剪贴板时用，避免带入转义序列）
@@ -569,6 +573,13 @@ final class KernelRunner {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: KernelPaths.runtimeConfig.path)
     }
 
+    func exportConfigData(for subscription: Subscription) throws -> Data {
+        let config = makeConfig(subscription: subscription,
+                                overrides: ProxyGroupStore.shared.overrides(for: subscription.id),
+                                applyMixin: true)
+        return try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+    }
+
     private static let geositeCN = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
     private static let geoipCN = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
 
@@ -577,6 +588,14 @@ final class KernelRunner {
     /// （见 ProxyTopology）。规则：国内/私网直连、其余走主选择器；全局：全部走主选择器；直连：全部直连。
     /// 未选订阅 / 无节点时一律直连。
     private func makeConfig(applyMixin: Bool = true) -> [String: Any] {
+        makeConfig(subscription: SubscriptionStore.shared.selectedSubscription,
+                   overrides: ProxyGroupStore.shared.overrides,
+                   applyMixin: applyMixin)
+    }
+
+    private func makeConfig(subscription: Subscription?,
+                            overrides: [String: String],
+                            applyMixin: Bool) -> [String: Any] {
         let settings = SettingsStore.shared
         let listen = settings.allowLan ? "0.0.0.0" : "127.0.0.1"
 
@@ -586,7 +605,7 @@ final class KernelRunner {
         // 订阅自带规则/分组（已转换落盘）。分组与路由模式解耦：只要开了导入且有 route.json 就读；
         // 其中 groups 永远用于建组，rules/ruleSet 仅在规则模式下用于分流。
         let imported = settings.importSubscriptionRules
-            ? SubscriptionStore.shared.selectedSubscription.flatMap {
+            ? subscription.flatMap {
                 ClashRuleImport.importedRoute(dir: SubscriptionStore.subrulesDir($0.id))
               }
             : nil
@@ -594,16 +613,28 @@ final class KernelRunner {
 
         // 出站：永远是「每节点独立出站 + 分组」。机场自带 proxy-groups 则用其原组（主选择器 = MATCH 去向组）；
         // 否则合成 Proxy(selector) + Auto(urltest)，主选择器 = Proxy（见 ProxyTopology）。
-        let nodes = SubscriptionStore.shared.selectedSubscription?.nodes ?? []
+        let nodes = subscription?.nodes ?? []
         let topo = ProxyTopology.build(
             nodes: nodes,
             importedGroups: hasAirportGroups ? imported!.groups : [],
             importedFinal: hasAirportGroups ? imported!.final : nil,
-            overrides: ProxyGroupStore.shared.overrides)
+            overrides: overrides,
+            healthCheckURL: settings.latencyTestURL)
         var outbounds = topo.outbounds
         outbounds.append(["type": "direct", "tag": "direct"])
+        let validOutboundTags = Set(outbounds.compactMap { $0["tag"] as? String })
         let hasProxy = topo.hasNodes
         let proxyTag = topo.master   // 路由 / DNS 里「走代理」指向的主选择器 tag（无节点时为 "direct"）
+        func validImportedRules(_ rules: [[String: Any]]) -> [[String: Any]] {
+            rules.compactMap { rule in
+                guard let outbound = rule["outbound"] as? String else { return rule }
+                return validOutboundTags.contains(outbound) ? rule : nil
+            }
+        }
+        func validFinal(_ final: String?) -> String {
+            guard let final, validOutboundTags.contains(final) else { return proxyTag }
+            return final
+        }
 
         // 路由
         var route: [String: Any] = ["auto_detect_interface": isTun ? settings.tun.autoDetectInterface : true]
@@ -617,7 +648,7 @@ final class KernelRunner {
         } else if hasAirportGroups, let imported {
             // 订阅自带规则（已转换落盘）：用它替代内置 geosite-cn/geoip-cn 分流，去向指向真实组。
             // 私网仍先直连；用户手填规则随后注入在最前（优先级最高）。
-            route["rules"] = [["action": "sniff"], ["ip_is_private": true, "outbound": "direct"]] + imported.rules
+            route["rules"] = [["action": "sniff"], ["ip_is_private": true, "outbound": "direct"]] + validImportedRules(imported.rules)
             route["rule_set"] = imported.ruleSet.map { set -> [String: Any] in
                 // 本地已有该 geo 的 .srs（geoip-cn/geosite-cn/ads 等）→ 改用 local，避免启动时经
                 // 尚未就绪的代理远程下载 → rule-set init 超时让 sing-box FATAL、内核起不来（典型 bootstrap 死锁）。
@@ -629,7 +660,7 @@ final class KernelRunner {
                 guard (set["download_detour"] as? String) == "proxy" else { return set }
                 var s = set; s["download_detour"] = proxyTag; return s
             }
-            route["final"] = imported.final ?? proxyTag
+            route["final"] = validFinal(imported.final)
         } else { // 规则分流（内置 geosite-cn/geoip-cn，去向 = 主选择器）
             route["rules"] = [
                 ["action": "sniff"],
@@ -680,7 +711,7 @@ final class KernelRunner {
         }
 
         var config: [String: Any] = [
-            "log": ["level": "info", "timestamp": true],
+            "log": ["level": settings.kernelLogLevel.rawValue, "timestamp": true],
             "inbounds": inbounds,
             "outbounds": outbounds,
             "route": route,
@@ -692,7 +723,31 @@ final class KernelRunner {
         // DNS 解析策略：sing-box 全局配置，所有模式生效（默认 ipv4_only）。
         // TUN 通告 IPv6 后 macOS 会优先走 IPv6，但直连/代理常无可用 IPv6 出口 →
         // 连上却无数据；ipv4_only 只给 IPv4 可规避，需要 IPv6 的用户可改 prefer_*。
-        var dns: [String: Any] = ["strategy": settings.dnsStrategy]
+        var dnsServers: [[String: Any]] = []
+        if settings.bootstrapDNSProvider == .system {
+            dnsServers.append(["tag": "bootstrap", "type": "local"])
+        } else {
+            dnsServers.append(["tag": "bootstrap-local", "type": "local"])
+            dnsServers.append(settings.bootstrapDNSProvider.server(tag: "bootstrap", domainResolver: "bootstrap-local"))
+        }
+        let remoteDetour = (isTun && settings.tun.dnsHijack && hasProxy && settings.remoteDNSProvider != .system) ? proxyTag : nil
+        dnsServers.append(settings.remoteDNSProvider.server(tag: "remote-dns", detour: remoteDetour))
+        dnsServers.append(settings.directDNSProvider.server(tag: "direct-dns"))
+
+        var dnsRules: [[String: Any]] = []
+        for (index, rule) in settings.domainDNSRules.enumerated() {
+            let tag = "domain-rule-dns-\(index + 1)"
+            dnsServers.append(rule.provider.server(tag: tag))
+            dnsRules.append(["domain_regex": rule.regexes, "server": tag])
+        }
+
+        var dns: [String: Any] = [
+            "strategy": settings.dnsStrategy,
+            "servers": dnsServers,
+            "final": (!hasProxy || mode == .direct) ? "direct-dns" : "remote-dns",
+        ]
+        route["default_domain_resolver"] = "bootstrap"
+        config["route"] = route
 
         // TUN + DNS 劫持：拦截 DNS 并经代理/直连分流解析，避免泄漏
         if isTun, settings.tun.dnsHijack {
@@ -701,20 +756,11 @@ final class KernelRunner {
             // 否则规则匹配不到、DNS 不会被劫持（app 直接用自带 DNS 拿到 AAAA）。
             rules.insert(["protocol": "dns", "action": "hijack-dns"], at: min(1, rules.count))
             route["rules"] = rules
-            route["default_domain_resolver"] = "local-dns" // 解析节点域名走直连，避免鸡生蛋
+            route["default_domain_resolver"] = "bootstrap" // 解析节点域名走本地 bootstrap，避免鸡生蛋
             config["route"] = route
+            dns["final"] = (!hasProxy || mode == .direct) ? "direct-dns" : "remote-dns"
 
-            var dnsServers: [[String: Any]] = []
-            if hasProxy {
-                dnsServers.append(["tag": "remote-dns", "type": "https", "server": "1.1.1.1", "detour": proxyTag])
-            }
-            // 不写 detour：sing-box 1.12+ 的 DNS 连接默认即直连，写 detour:"direct"
-            // 会被判为「detour to an empty direct outbound makes no sense」而启动失败。
-            dnsServers.append(["tag": "local-dns", "type": "https", "server": "223.5.5.5"])
-            dns["servers"] = dnsServers
-            dns["final"] = hasProxy ? "remote-dns" : "local-dns"
-
-            // DNS 分流（关键）：让国内域名走 local-dns（223.5.5.5，直连）解析。否则所有 DNS 都
+            // DNS 分流（关键）：让国内域名走 direct-dns 解析。否则所有 DNS 都
             // 兜底经代理的海外 remote-dns —— 国内域名既白花一次 ~200ms 海外往返，又被解析成海外
             // CDN IP，再被路由判直连 → 直连一个绕远路的海外 IP，连接页显示「直连」却很慢。
             // 用 app 内置的 geosite-cn（齐全的中国域名表）专给 DNS 判定，与路由分流的 rule_set 解耦：
@@ -726,15 +772,16 @@ final class KernelRunner {
                     sets.append(["type": "local", "tag": "geosite-cn", "format": "binary", "path": geositeCN.path])
                     route["rule_set"] = sets
                 }
-                dns["rules"] = [["rule_set": ["geosite-cn"], "server": "local-dns"]]
+                dnsRules.append(["rule_set": ["geosite-cn"], "server": "direct-dns"])
             }
         }
+        if !dnsRules.isEmpty { dns["rules"] = dnsRules }
         config["dns"] = dns
 
         // 注入用户自定义规则：放在 sniff/hijack-dns 之后、内置分流之前，优先级最高。
         // 「走代理」去向 = 主选择器 tag（proxyTag），无节点时传 nil 跳过。
         let ruleProxyTag = hasProxy ? proxyTag : nil
-        let userRules = RuleStore.shared.singBoxRules(proxyTag: ruleProxyTag)
+        let userRules = RuleStore.shared.singBoxRules(proxyTag: ruleProxyTag, validOutboundTags: validOutboundTags)
         if !userRules.isEmpty {
             var rules = (route["rules"] as? [[String: Any]]) ?? []
             let prefix = rules.prefix {
