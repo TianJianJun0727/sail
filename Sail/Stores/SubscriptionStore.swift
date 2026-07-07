@@ -248,7 +248,11 @@ final class SubscriptionStore {
         let parent = finalDir.deletingLastPathComponent()
         let tmpDir = parent.appendingPathComponent("\(id.uuidString).tmp-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.removeItem(at: tmpDir)
-        let ok = await ClashRuleImport.build(yaml: clashText, into: tmpDir, hasProxy: true, proxyPort: proxyPort)
+        let ok = await ClashRuleImport.build(yaml: clashText,
+                                             into: tmpDir,
+                                             routeBaseDir: finalDir,
+                                             hasProxy: true,
+                                             proxyPort: proxyPort)
         guard ok else {
             try? FileManager.default.removeItem(at: tmpDir)
             return

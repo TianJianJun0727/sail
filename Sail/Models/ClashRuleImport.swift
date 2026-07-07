@@ -12,10 +12,15 @@ enum ClashRuleImport {
     /// 把订阅的路由转成 sing-box route 片段写进 dir/route.json，rule_set 源文件同目录。
     /// 返回是否产出了规则。hasProxy=false 时丢弃「走代理」类规则。
     @discardableResult
-    nonisolated static func build(yaml: String, into dir: URL, hasProxy: Bool, proxyPort: Int?) async -> Bool {
+    nonisolated static func build(yaml: String,
+                                  into dir: URL,
+                                  routeBaseDir: URL? = nil,
+                                  hasProxy: Bool,
+                                  proxyPort: Int?) async -> Bool {
         let clashRules = ClashYAMLParser.rules(yaml)
         guard !clashRules.isEmpty else { return false }
         let providers = ClashYAMLParser.ruleProviders(yaml)
+        let routeDir = routeBaseDir ?? dir
 
         // 去向直接指向真实组名（该组会作为 selector/url-test 出站被生成）；DIRECT→直连，REJECT→拦截(nil)。
         func outboundFor(_ target: String) -> String? {
@@ -51,11 +56,13 @@ enum ClashRuleImport {
                     guard let prov = providers[arg], let url = prov["url"] as? String else { continue }
                     let behavior = (prov["behavior"] as? String ?? "classical").lowercased()
                     let file = dir.appendingPathComponent("\(tag).json")
-                    guard await downloadAndConvert(url, behavior: behavior, to: file, proxyPort: proxyPort) else {
+                    let routePath = routeDir.appendingPathComponent(file.lastPathComponent)
+                    let cache = cacheFile(prefix: tag, key: "source|\(behavior)|\(url)", ext: "json")
+                    guard await downloadAndConvert(url, behavior: behavior, to: file, cacheFile: cache, proxyPort: proxyPort) else {
                         failedRuleSets.append(tag)
                         continue
                     }
-                    ruleSetDefs.append(["type": "local", "tag": tag, "format": "source", "path": file.path])
+                    ruleSetDefs.append(["type": "local", "tag": tag, "format": "source", "path": routePath.path])
                     seenTags.insert(tag)
                 }
                 sbRules.append(withAction(["rule_set": [tag]], out))
@@ -67,7 +74,7 @@ enum ClashRuleImport {
                     continue
                 }
                 let tag = "geoip-\(code)"
-                guard await addGeoRuleSet(tag, kind: "geoip", into: &ruleSetDefs, seen: &seenTags, dir: dir, proxyPort: proxyPort) else {
+                guard await addGeoRuleSet(tag, kind: "geoip", into: &ruleSetDefs, seen: &seenTags, dir: dir, routeDir: routeDir, proxyPort: proxyPort) else {
                     failedRuleSets.append(tag)
                     continue
                 }
@@ -80,7 +87,7 @@ enum ClashRuleImport {
                     continue
                 }
                 let tag = "geosite-\(code)"
-                guard await addGeoRuleSet(tag, kind: "geosite", into: &ruleSetDefs, seen: &seenTags, dir: dir, proxyPort: proxyPort) else {
+                guard await addGeoRuleSet(tag, kind: "geosite", into: &ruleSetDefs, seen: &seenTags, dir: dir, routeDir: routeDir, proxyPort: proxyPort) else {
                     failedRuleSets.append(tag)
                     continue
                 }
@@ -137,9 +144,12 @@ enum ClashRuleImport {
         -> (rules: [[String: Any]], ruleSet: [[String: Any]], final: String?, groups: [[String: Any]])? {
         guard let data = try? Data(contentsOf: dir.appendingPathComponent("route.json")),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let ruleSet = normalizeLocalRuleSetPaths(
+            obj["rule_set"] as? [[String: Any]] ?? [],
+            dir: dir)
         let normalized = normalizePrivateGeoIP(
             rules: obj["rules"] as? [[String: Any]] ?? [],
-            ruleSet: obj["rule_set"] as? [[String: Any]] ?? [])
+            ruleSet: ruleSet)
         return (normalized.rules,
                 normalized.ruleSet,
                 obj["final"] as? String,
@@ -159,12 +169,15 @@ enum ClashRuleImport {
                                                   into defs: inout [[String: Any]],
                                                   seen: inout Set<String>,
                                                   dir: URL,
+                                                  routeDir: URL,
                                                   proxyPort: Int?) async -> Bool {
         guard !seen.contains(tag) else { return true }
         let file = dir.appendingPathComponent("\(tag).srs")
+        let routePath = routeDir.appendingPathComponent(file.lastPathComponent)
         let url = "https://raw.githubusercontent.com/SagerNet/sing-\(kind)/rule-set/\(tag).srs"
-        if await downloadSRS(url, to: file, proxyPort: proxyPort) {
-            defs.append(["type": "local", "tag": tag, "format": "binary", "path": file.path])
+        let cache = cacheFile(prefix: tag, key: "binary|\(url)", ext: "srs")
+        if await downloadSRS(url, to: file, cacheFile: cache, proxyPort: proxyPort) {
+            defs.append(["type": "local", "tag": tag, "format": "binary", "path": routePath.path])
             seen.insert(tag)
             return true
         }
@@ -177,7 +190,67 @@ enum ClashRuleImport {
         return false
     }
 
-    private nonisolated static func downloadSRS(_ urlString: String, to file: URL, proxyPort: Int?) async -> Bool {
+    private nonisolated static var ruleSetCacheDir: URL {
+        KernelPaths.supportDir.appendingPathComponent("ruleset-cache", isDirectory: true)
+    }
+
+    private nonisolated static func cacheFile(prefix: String, key: String, ext: String) -> URL {
+        ruleSetCacheDir.appendingPathComponent("\(prefix)-\(fnv1a64(key)).\(ext)")
+    }
+
+    private nonisolated static func fnv1a64(_ text: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(hash, radix: 16)
+    }
+
+    private nonisolated static func copyRuleSet(from source: URL, to dest: URL) -> Bool {
+        let tmp = dest.deletingLastPathComponent()
+            .appendingPathComponent(".\(dest.lastPathComponent).tmp-\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: tmp)
+            try FileManager.default.copyItem(at: source, to: tmp)
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.moveItem(at: tmp, to: dest)
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+            return false
+        }
+    }
+
+    private nonisolated static func restoreCachedSRS(_ cacheFile: URL, to file: URL) -> Bool {
+        FileManager.default.fileExists(atPath: cacheFile.path)
+            && isValidSRS(cacheFile)
+            && copyRuleSet(from: cacheFile, to: file)
+    }
+
+    private nonisolated static func restoreCachedSource(_ cacheFile: URL, to file: URL) -> Bool {
+        FileManager.default.fileExists(atPath: cacheFile.path)
+            && copyRuleSet(from: cacheFile, to: file)
+    }
+
+    private nonisolated static func normalizeLocalRuleSetPaths(_ ruleSet: [[String: Any]], dir: URL) -> [[String: Any]] {
+        ruleSet.map { set in
+            guard (set["type"] as? String) == "local",
+                  let path = set["path"] as? String else { return set }
+            if FileManager.default.fileExists(atPath: path) { return set }
+            let fallback = dir.appendingPathComponent(URL(fileURLWithPath: path).lastPathComponent)
+            guard FileManager.default.fileExists(atPath: fallback.path) else { return set }
+            var fixed = set
+            fixed["path"] = fallback.path
+            return fixed
+        }
+    }
+
+    private nonisolated static func downloadSRS(_ urlString: String,
+                                                to file: URL,
+                                                cacheFile: URL,
+                                                proxyPort: Int?) async -> Bool {
         guard let url = URL(string: urlString) else { return false }
         let cfg = URLSessionConfiguration.ephemeral
         if let port = proxyPort {
@@ -193,12 +266,15 @@ enum ClashRuleImport {
         do {
             let (tmp, resp) = try await URLSession(configuration: cfg).download(from: url)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
-                  isValidSRS(tmp) else { return false }
+                  isValidSRS(tmp) else {
+                return restoreCachedSRS(cacheFile, to: file)
+            }
             try? FileManager.default.removeItem(at: file)
             try FileManager.default.moveItem(at: tmp, to: file)
+            _ = copyRuleSet(from: file, to: cacheFile)
             return true
         } catch {
-            return false
+            return restoreCachedSRS(cacheFile, to: file)
         }
     }
 
@@ -283,7 +359,11 @@ enum ClashRuleImport {
 
     // MARK: rule-provider 下载 + 转 sing-box rule_set 源
 
-    private nonisolated static func downloadAndConvert(_ urlString: String, behavior: String, to file: URL, proxyPort: Int?) async -> Bool {
+    private nonisolated static func downloadAndConvert(_ urlString: String,
+                                                       behavior: String,
+                                                       to file: URL,
+                                                       cacheFile: URL,
+                                                       proxyPort: Int?) async -> Bool {
         guard let url = URL(string: urlString) else { return false }
         let cfg = URLSessionConfiguration.ephemeral
         if let port = proxyPort {
@@ -296,7 +376,9 @@ enum ClashRuleImport {
         defer { session.finishTasksAndInvalidate() }   // 用完主动关连接，经 7890 时不给它留 TIME_WAIT
         guard let (data, resp) = try? await session.data(for: URLRequest(url: url, timeoutInterval: 30)),
               (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
-              let text = String(data: data, encoding: .utf8) else { return false }
+              let text = String(data: data, encoding: .utf8) else {
+            return restoreCachedSource(cacheFile, to: file)
+        }
 
         var m = Matchers()
         for entry in payloadEntries(text) {
@@ -314,9 +396,15 @@ enum ClashRuleImport {
         }
         let objs = m.ruleObjects()
         guard !objs.isEmpty,
-              let out = try? JSONSerialization.data(withJSONObject: ["version": 2, "rules": objs]) else { return false }
+              let out = try? JSONSerialization.data(withJSONObject: ["version": 2, "rules": objs]) else {
+            return restoreCachedSource(cacheFile, to: file)
+        }
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        return (try? out.write(to: file, options: .atomic)) != nil
+        guard (try? out.write(to: file, options: .atomic)) != nil else {
+            return restoreCachedSource(cacheFile, to: file)
+        }
+        _ = copyRuleSet(from: file, to: cacheFile)
+        return true
     }
 
     /// 取 Clash provider 的 payload 列表项（`payload:` 下的 `- 'x'` 行；去引号）。纯行解析，足够稳。
