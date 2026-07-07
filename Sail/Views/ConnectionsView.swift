@@ -46,7 +46,7 @@ struct ConnectionsView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        HStack(spacing: 16) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text("活动连接")
                     .font(.system(size: 19, weight: .semibold, design: .rounded))
@@ -55,18 +55,8 @@ struct ConnectionsView: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(Color(nsColor: .quaternaryLabelColor).opacity(0.5), in: Capsule())
-                Spacer()
-                Picker("", selection: $sort) {
-                    ForEach(Sort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented).labelsHidden().fixedSize()
-                Button(role: .destructive) {
-                    monitor.closeAll()
-                } label: {
-                    Label("全部关闭", systemImage: "xmark.circle")
-                }
-                .controlSize(.small)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(.secondary)
@@ -75,9 +65,30 @@ struct ConnectionsView: View {
             }
             .padding(.horizontal, 9).padding(.vertical, 6)
             .background(Color(nsColor: .quaternaryLabelColor).opacity(0.4), in: Capsule())
-            .frame(maxWidth: 300)
+            .frame(width: 300)
+
+            HStack(spacing: 10) {
+                Picker("", selection: $sort) {
+                    ForEach(Sort.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 150)
+                Button(role: .destructive) {
+                    monitor.closeAll()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "xmark.circle")
+                        Text("断开全部")
+                    }
+                    .lineLimit(1)
+                    .fixedSize()
+                }
+                .controlSize(.small)
+            }
+            .frame(width: 270, alignment: .trailing)
         }
-        .pageTopBar(alignment: .center)
+        .pageTopBar()
     }
 
     private var list: some View {
