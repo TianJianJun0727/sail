@@ -32,6 +32,15 @@ func clearPID(ifEqual expected: pid_t) { pidLock.withLock { if $0 == expected { 
 
 func elog(_ s: String) { FileHandle.standardError.write(Data(("sail-helper: " + s + "\n").utf8)) }
 
+func setCloseOnExec(_ fd: Int32, _ name: String) -> Bool {
+    guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
+        let e = errno
+        elog("\(name) 设置 CLOEXEC 失败(errno=\(e), \(String(cString: strerror(e))))")
+        return false
+    }
+    return true
+}
+
 /// 安装时记录的那个用户(allowedUID)是否仍有名为 "Sail" 的进程在跑。
 /// 查询失败一律返回 true（保守：绝不因查询出错而误停用户正在用的内核）。
 func isOwnerAlive() -> Bool {
@@ -161,8 +170,12 @@ func startSingBox(_ configJSON: String) -> (Bool, String) {
     let readFD = fds[0], writeFD = fds[1]
     // 管道两端标 CLOEXEC：file_actions 已在本次子进程里 dup 到 1/2 后关掉它们（dup 后的 1/2 不带 CLOEXEC，日志照常），
     // 这里再防「后续/并发 spawn 误继承旧管道 fd」。
-    fcntl(readFD, F_SETFD, FD_CLOEXEC)
-    fcntl(writeFD, F_SETFD, FD_CLOEXEC)
+    guard setCloseOnExec(readFD, "日志管道读端"),
+          setCloseOnExec(writeFD, "日志管道写端") else {
+        close(readFD)
+        close(writeFD)
+        return (false, "设置日志管道 CLOEXEC 失败")
+    }
 
     LogWriter.shared.reset()   // 每次启动开一份全新日志
 
@@ -245,7 +258,8 @@ signal(SIGPIPE, SIG_IGN)
 unlink(kSocketPath)
 let listenFD = socket(AF_UNIX, SOCK_STREAM, 0)
 guard listenFD >= 0 else { elog("socket() 失败"); exit(1) }
-fcntl(listenFD, F_SETFD, FD_CLOEXEC)   // 别让 posix_spawn 起的 root 内核继承这个特权监听 socket
+// 别让 posix_spawn 起的 root 内核继承这个特权监听 socket；失败时直接退出，避免留下继承风险。
+guard setCloseOnExec(listenFD, "监听 socket") else { exit(1) }
 
 var addr = sockaddr_un()
 addr.sun_family = sa_family_t(AF_UNIX)
@@ -296,7 +310,8 @@ while true {
     let conn = accept(listenFD, nil, nil)
     if conn < 0 { continue }
     defer { close(conn) }   // 任何分支退出本次迭代都关闭连接 FD，杜绝泄露
-    fcntl(conn, F_SETFD, FD_CLOEXEC)   // 处理 start 命令时起的内核不应继承这条客户端连接
+    // 处理 start 命令时起的内核不应继承这条客户端连接；失败则丢弃本次请求。
+    guard setCloseOnExec(conn, "客户端连接") else { continue }
     // 复核调用方 uid（socket 0600 已限到该用户，这里再核一道）
     var uid: uid_t = 0, gid: gid_t = 0
     guard getpeereid(conn, &uid, &gid) == 0, uid == allowedUID else {

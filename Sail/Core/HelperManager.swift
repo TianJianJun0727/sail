@@ -4,12 +4,12 @@ import Foundation
 /// 一次管理员授权（osascript）把 helper + 内核副本装到 root-only 路径、写 LaunchDaemon plist 并 bootstrap。
 /// 所有特权命令直接 inline 进 osascript 一次性执行，不落任何临时脚本 → 无 TOCTOU 窗口。
 enum HelperManager {
-    static let label = "com.unreadcode.Sail.helper"
-    static let helperDest = "/Library/PrivilegedHelperTools/\(label)"
-    static let plistDest = "/Library/LaunchDaemons/\(label).plist"
-    static let supportDir = "/Library/Application Support/Sail"
-    static let singboxDest = supportDir + "/sing-box"
-    static let kernelLog = supportDir + "/kernel.log"   // 须与 Helper/main.swift 的 kLogPath 一致
+    nonisolated static let label = "com.unreadcode.Sail.helper"
+    nonisolated static let helperDest = "/Library/PrivilegedHelperTools/\(label)"
+    nonisolated static let plistDest = "/Library/LaunchDaemons/\(label).plist"
+    nonisolated static let supportDir = "/Library/Application Support/Sail"
+    nonisolated static let singboxDest = supportDir + "/sing-box"
+    nonisolated static let kernelLog = supportDir + "/kernel.log"   // 须与 Helper/main.swift 的 kLogPath 一致
 
     /// app 内嵌的 helper 与内核源路径。
     nonisolated static var embeddedHelper: String { Bundle.main.bundlePath + "/Contents/Helpers/sail-helper" }
