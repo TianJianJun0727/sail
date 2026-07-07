@@ -182,13 +182,17 @@ final class KernelRunner {
         do {
             if useHelper {
                 // helper 模式：配置交给 root helper 起 sing-box（TUN 需要 root，本进程不持有内核进程）
-                let data = try JSONSerialization.data(withJSONObject: makeConfig())
+                let config = makeConfig()
+                let data = try JSONSerialization.data(withJSONObject: config)
                 let (ok, err) = await SailHelperClient.startKernel(config: String(decoding: data, as: UTF8.self))
                 guard ok else {
                     let reason = err ?? "helper 启动失败"
                     appendLogs(["[TUN] helper 启动内核失败：\(reason)"])
                     throw KernelError.message("TUN 启动失败：\(reason)")
                 }
+                // root/helper 模式下真正运行的是 /Library/Application Support/Sail/config.run.json。
+                // 同步写一份用户可读副本，避免用户目录 config.run.json 停留在上一次用户态配置。
+                try? writeRuntimeConfigCopy(config)
                 ranViaHelper = true
                 process = nil
                 startedAt = Date()
@@ -567,6 +571,10 @@ final class KernelRunner {
     private func writeConfig() throws {
         try FileManager.default.createDirectory(at: KernelPaths.supportDir, withIntermediateDirectories: true)
         let config = makeConfig()
+        try writeRuntimeConfigCopy(config)
+    }
+
+    private func writeRuntimeConfigCopy(_ config: [String: Any]) throws {
         let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted])
         try data.write(to: KernelPaths.runtimeConfig, options: .atomic)
         // 配置含 clash_api 的随机 secret，收紧为仅属主可读写，防本机其它进程读取后偷切节点/读流量
