@@ -16,6 +16,8 @@ struct Subscription: Codable, Identifiable, Equatable {
     var autoUpdate: Bool = true                    // 允许自动更新
     var updateIntervalMin: Int = 1440              // 更新间隔（分钟）
     var updateViaProxy: Bool = false               // 更新时经内核混合端口拉取（默认直连；内核未运行时自动回退直连）
+    var localFilePath: String?                     // 本地订阅文件路径；nil = 远程 URL 订阅
+    var localFileBookmark: Data?                   // 本地订阅 security-scoped bookmark；非沙盒下可为空
 
     // 来自 subscription-userinfo 头（字节）
     var upload: Int64 = 0
@@ -26,6 +28,7 @@ struct Subscription: Codable, Identifiable, Equatable {
     var used: Int64 { upload + download }
     var hasTraffic: Bool { total > 0 }
     var usedFraction: Double { total > 0 ? min(1, Double(used) / Double(total)) : 0 }
+    var isLocalFile: Bool { localFilePath != nil }
 }
 
 /// 抓取结果：节点 + 机场用量信息 + 远端名称（Content-Disposition 文件名）。
@@ -93,8 +96,27 @@ final class SubscriptionStore {
         await refresh(sub.id, autoNameIndex: index)
     }
 
+    func addLocalFile(_ fileURL: URL) async {
+        let path = fileURL.path
+        let displayName = fileURL.deletingPathExtension().lastPathComponent
+        var sub = Subscription(name: displayName, url: path)
+        sub.autoUpdate = false
+        sub.updateViaProxy = false
+        sub.localFilePath = path
+        sub.localFileBookmark = try? fileURL.bookmarkData(options: [.withSecurityScope],
+                                                          includingResourceValuesForKeys: nil,
+                                                          relativeTo: nil)
+        subscriptions.append(sub)
+        save()
+        await refresh(sub.id)
+    }
+
     func refresh(_ id: UUID, autoNameIndex: Int? = nil, viaProxy: Bool = false) async {
         guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        if let path = subscriptions[idx].localFilePath {
+            await refreshLocal(id, path: path, viaProxy: viaProxy)
+            return
+        }
         let url = subscriptions[idx].url
         let ua = subscriptions[idx].userAgent
         let timeout = subscriptions[idx].timeoutSec
@@ -104,27 +126,12 @@ final class SubscriptionStore {
         defer { busyIDs.remove(id) }
         do {
             let result = try await Self.fetchNodes(from: url, userAgent: ua, timeoutSec: timeout, proxyPort: proxyPort)
-            guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
-            subscriptions[i].nodes = result.nodes
-            subscriptions[i].updatedAt = Date()
-            subscriptions[i].lastError = nil
-            subscriptions[i].upload = result.upload
-            subscriptions[i].download = result.download
-            subscriptions[i].total = result.total
-            subscriptions[i].expire = result.expire > 0 ? Date(timeIntervalSince1970: result.expire) : nil
-            // 名称为空时自动命名：远端名 > 「订阅 N」
-            if subscriptions[i].name.isEmpty {
-                subscriptions[i].name = result.remoteName ?? "订阅 \(autoNameIndex ?? i)"
-            }
-            save()
-            // 导入订阅自带规则（rules/rule-providers）→ 转 sing-box route 落盘。仅在开关开启时下载转换（联网较重）。
-            if SettingsStore.shared.importSubscriptionRules, let yaml = result.clashText {
-                await ClashRuleImport.build(yaml: yaml, into: Self.subrulesDir(id), hasProxy: true, proxyPort: proxyPort)
-            }
-            // 刷新的是当前订阅 → 节点/分组可能变，重建运行配置（选择 override 按订阅持久化，自动复用）。
-            if KernelRunner.shared.isRunning, selectedSubscription?.id == id {
-                await KernelRunner.shared.restartIfConfigChanged()
-            }
+            await applyRefreshResult(id,
+                                     nodes: result.nodes,
+                                     autoName: result.remoteName ?? "订阅 \(autoNameIndex ?? idx)",
+                                     traffic: (result.upload, result.download, result.total, result.expire),
+                                     clashText: result.clashText,
+                                     proxyPort: proxyPort)
             return
         } catch {
             guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
@@ -134,6 +141,66 @@ final class SubscriptionStore {
             }
         }
         save()
+    }
+
+    private func refreshLocal(_ id: UUID, path: String, viaProxy: Bool) async {
+        busyIDs.insert(id)
+        defer { busyIDs.remove(id) }
+        do {
+            guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+            let url = try localFileURL(for: id, fallbackPath: path)
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let sub = subscriptions[idx]
+            let proxyPort = (viaProxy && KernelRunner.shared.isRunning) ? SettingsStore.shared.mixedPort : nil
+            guard let nodes = await Self.parse(text, userAgent: sub.userAgent, timeoutSec: sub.timeoutSec, proxyPort: proxyPort),
+                  !nodes.isEmpty else {
+                throw KernelError.message("未解析到节点（暂不支持该本地订阅格式？）")
+            }
+            await applyRefreshResult(id,
+                                     nodes: nodes,
+                                     autoName: url.deletingPathExtension().lastPathComponent,
+                                     traffic: nil,
+                                     clashText: ClashYAMLParser.looksLikeClash(text) ? text : nil,
+                                     proxyPort: proxyPort)
+        } catch {
+            guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+            subscriptions[i].lastError = (error as? KernelError)?.description ?? error.localizedDescription
+            save()
+        }
+    }
+
+    private func applyRefreshResult(_ id: UUID,
+                                    nodes: [ProxyNode],
+                                    autoName: String?,
+                                    traffic: (upload: Int64, download: Int64, total: Int64, expire: TimeInterval)?,
+                                    clashText: String?,
+                                    proxyPort: Int?) async {
+        guard let i = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        subscriptions[i].nodes = nodes
+        subscriptions[i].updatedAt = Date()
+        subscriptions[i].lastError = nil
+        if let traffic {
+            subscriptions[i].upload = traffic.upload
+            subscriptions[i].download = traffic.download
+            subscriptions[i].total = traffic.total
+            subscriptions[i].expire = traffic.expire > 0 ? Date(timeIntervalSince1970: traffic.expire) : nil
+        }
+        if subscriptions[i].name.isEmpty, let autoName {
+            subscriptions[i].name = autoName
+        }
+        save()
+        if SettingsStore.shared.importSubscriptionRules {
+            if let clashText {
+                await rebuildSubrules(id, clashText: clashText, proxyPort: proxyPort)
+            } else {
+                clearSubrules(id)
+            }
+        }
+        if KernelRunner.shared.isRunning, selectedSubscription?.id == id {
+            await KernelRunner.shared.restartIfConfigChanged()
+        }
     }
 
     func refreshAll() async {
@@ -169,10 +236,65 @@ final class SubscriptionStore {
         KernelPaths.supportDir.appendingPathComponent("subrules/\(id.uuidString)", isDirectory: true)
     }
 
+    private func clearSubrules(_ id: UUID) {
+        let dir = Self.subrulesDir(id)
+        if FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    private func rebuildSubrules(_ id: UUID, clashText: String, proxyPort: Int?) async {
+        let finalDir = Self.subrulesDir(id)
+        let parent = finalDir.deletingLastPathComponent()
+        let tmpDir = parent.appendingPathComponent("\(id.uuidString).tmp-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.removeItem(at: tmpDir)
+        let ok = await ClashRuleImport.build(yaml: clashText, into: tmpDir, hasProxy: true, proxyPort: proxyPort)
+        guard ok else {
+            try? FileManager.default.removeItem(at: tmpDir)
+            return
+        }
+        try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: finalDir)
+        do {
+            try FileManager.default.moveItem(at: tmpDir, to: finalDir)
+        } catch {
+            try? FileManager.default.removeItem(at: tmpDir)
+        }
+    }
+
+    /// 解析本地文件的 security-scoped bookmark 并返回 URL。
+    /// 不缓存 URL，因为 security-scoped 访问权限需要在调用方显式管理。
+    /// 调用方需要使用 startAccessingSecurityScopedResource() / stopAccessingSecurityScopedResource() 管理访问周期。
+    private func localFileURL(for id: UUID, fallbackPath: String) throws -> URL {
+        guard let idx = subscriptions.firstIndex(where: { $0.id == id }),
+              let bookmark = subscriptions[idx].localFileBookmark else {
+            // 没有 bookmark，使用 fallback path（非沙盒场景）
+            return URL(fileURLWithPath: fallbackPath)
+        }
+
+        var stale = false
+        let url = try URL(resolvingBookmarkData: bookmark,
+                          options: [.withSecurityScope],
+                          relativeTo: nil,
+                          bookmarkDataIsStale: &stale)
+
+        // 如果 bookmark 已过期，更新它
+        if stale {
+            subscriptions[idx].localFileBookmark = try? url.bookmarkData(options: [.withSecurityScope],
+                                                                         includingResourceValuesForKeys: nil,
+                                                                         relativeTo: nil)
+            subscriptions[idx].localFilePath = url.path
+            subscriptions[idx].url = url.path
+            save()
+        }
+
+        return url
+    }
+
     func remove(_ id: UUID) {
         let wasActive = selectedSubscription?.id == id
         subscriptions.removeAll { $0.id == id }
-        try? FileManager.default.removeItem(at: Self.subrulesDir(id))   // 清理导入规则缓存
+        clearSubrules(id)   // 清理导入规则缓存
         if selectedSubscriptionID == id {
             selectedSubscriptionID = nil
             saveSubSelection()

@@ -40,6 +40,11 @@ final class ProxyGroupStore {
     var overrides: [String: String] { overridesBySub[subKey] ?? [:] }
     private var subKey: String { SubscriptionStore.shared.selectedSubscription?.id.uuidString ?? "default" }
 
+    func overrides(for subscriptionID: UUID?) -> [String: String] {
+        guard let subscriptionID else { return overridesBySub["default"] ?? [:] }
+        return overridesBySub[subscriptionID.uuidString] ?? [:]
+    }
+
     /// 当前订阅的主选择器组名：机场自带分组 → 其 MATCH 去向组；否则合成的 "Proxy"。
     /// url-test 永远只读自动，要钉节点请切其父 selector（合成模式下即 Proxy）。
     var masterGroupName: String {
@@ -134,7 +139,8 @@ final class ProxyGroupStore {
             nodes: sub.nodes,
             importedGroups: hasAirportGroups ? imported!.groups : [],
             importedFinal: hasAirportGroups ? imported!.final : nil,
-            overrides: overrides)
+            overrides: overrides,
+            healthCheckURL: SettingsStore.shared.latencyTestURL)
         let parsed = Self.parsePersisted(topo.groupOutbounds, protoByTag: topo.protoByTag)
         if parsed != groups { groups = parsed }
         live = false; loaded = true
@@ -250,58 +256,114 @@ final class ProxyGroupStore {
         guard live else { await testGroupOffline(group); return }
 
         let timeout = SettingsStore.shared.latencyTimeoutMs
-        let names = group.members.map(\.name)
+        let testURL = SettingsStore.shared.latencyTestURL
+        let namesByMember = leafNamesByTopMember(for: group)
+        let names = namesByMember.flatMap(\.leaves).uniqued()
+        guard !names.isEmpty else { return }
         let port = self.port
         let results: [String: Int?] = await withTaskGroup(of: (String, Int?).self) { tg in
-            for n in names { tg.addTask { (n, await Self.delayBest(port: port, name: n, timeoutMs: timeout)) } }
+            for n in names { tg.addTask { (n, await Self.delayBest(port: port, name: n, testURL: testURL, timeoutMs: timeout)) } }
             var acc: [String: Int?] = [:]
             for await r in tg { acc[r.0] = r.1 }
             return acc
         }
-        if let gi = groups.firstIndex(where: { $0.id == group.id }) {
-            for mi in groups[gi].members.indices where results[groups[gi].members[mi].name] != nil {
-                groups[gi].members[mi].delay = results[groups[gi].members[mi].name] ?? nil
-            }
-        }
+        applyDelayResults(for: group.name, leafResults: results, mapping: namesByMember)
         await refresh()   // url-test 组测速后会自动改 now，刷新拿到最新选择
+        applyDelayResults(for: group.name, leafResults: results, mapping: namesByMember)
     }
 
-    /// 内核未运行时的整组测速：成员 tag → 订阅节点（嵌套组成员跳过），交给 LatencyTester
-    /// 冷路径（独立临时 sing-box 实例测、与主内核无关），完成后把延迟写回成员。
+    /// 内核未运行时的整组测速：递归展开嵌套组到真实节点，交给 LatencyTester
+    /// 冷路径（独立临时 sing-box 实例测、与主内核无关），完成后把延迟聚合写回当前组成员。
     private func testGroupOffline(_ group: Group) async {
         guard let sub = SubscriptionStore.shared.selectedSubscription, !sub.nodes.isEmpty else { return }
         let tagToNode = ProxyTopology.tagToNodeMap(sub.nodes)
-        // 真实节点成员（非嵌套组）才能直接测；保留 tag→node 以便写回。
-        let pairs = group.members.compactMap { m -> (tag: String, node: ProxyNode)? in
-            guard !m.isGroup, let n = tagToNode[m.name] else { return nil }
-            return (m.name, n)
+        let namesByMember = leafNamesByTopMember(for: group)
+        let leafTags = namesByMember.flatMap(\.leaves).uniqued()
+        let pairs = leafTags.compactMap { tag -> (tag: String, node: ProxyNode)? in
+            guard let node = tagToNode[tag] else { return nil }
+            return (tag, node)
         }
         guard !pairs.isEmpty else { return }
-        await LatencyTester.shared.testAll(pairs.map(\.node))
-        guard let gi = groups.firstIndex(where: { $0.id == group.id }) else { return }
-        for (tag, node) in pairs {
-            guard let mi = groups[gi].members.firstIndex(where: { $0.name == tag }) else { continue }
+        await LatencyTester.shared.testAll(pairs.map { $0.node })
+        let results: [String: Int?] = Dictionary(uniqueKeysWithValues: pairs.map { tag, node in
+            let ms: Int?
             switch LatencyTester.shared.result(for: node) {
-            case .ok(let ms): groups[gi].members[mi].delay = ms
-            case .timeout:    groups[gi].members[mi].delay = nil
-            default: break
+            case .ok(let value): ms = value
+            case .timeout: ms = nil
+            default: ms = nil
+            }
+            return (tag, ms)
+        })
+        applyDelayResults(for: group.name, leafResults: results, mapping: namesByMember)
+    }
+
+    private func applyDelayResults(
+        for groupName: String,
+        leafResults results: [String: Int?],
+        mapping namesByMember: [(top: String, leaves: [String])]
+    ) {
+        // 先用聚合延迟更新目标组的顶层成员（嵌套组显示其所有叶子节点的最小延迟）
+        if let gi = groups.firstIndex(where: { $0.id == groupName }) {
+            let aggregated = aggregate(results: results, by: namesByMember)
+            for mi in groups[gi].members.indices {
+                let name = groups[gi].members[mi].name
+                guard aggregated.keys.contains(name) else { continue }
+                groups[gi].members[mi].delay = aggregated[name] ?? nil
+            }
+        }
+        // 再用原始叶子结果更新所有组中的真实节点成员（非嵌套组的成员）
+        // 注意：只更新非组成员，避免覆盖上面写入的聚合延迟
+        let groupNames = Set(groups.map { $0.name })
+        for gi in groups.indices {
+            for mi in groups[gi].members.indices {
+                let member = groups[gi].members[mi]
+                // 跳过嵌套组成员，只更新真实节点
+                guard !member.isGroup, !groupNames.contains(member.name) else { continue }
+                if let result = results[member.name] {
+                    groups[gi].members[mi].delay = result
+                }
             }
         }
     }
 
+    private func leafNamesByTopMember(for group: Group) -> [(top: String, leaves: [String])] {
+        let byName = Dictionary(groups.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        func leaves(from member: Member, visiting: Set<String>) -> [String] {
+            if member.isGroup, let nested = byName[member.name] {
+                guard !visiting.contains(nested.name) else { return [] }
+                var nextVisiting = visiting
+                nextVisiting.insert(nested.name)
+                return nested.members.flatMap { leaves(from: $0, visiting: nextVisiting) }
+            }
+            return SpecialOutbound.isSpecial(member.name) ? [] : [member.name]
+        }
+        return group.members.map { member in
+            (top: member.name, leaves: leaves(from: member, visiting: [group.name]).uniqued())
+        }
+    }
+
+    private func aggregate(results: [String: Int?], by mapping: [(top: String, leaves: [String])]) -> [String: Int?] {
+        Dictionary(uniqueKeysWithValues: mapping.map { item in
+            let values = item.leaves.compactMap { leaf -> Int? in
+                guard let result = results[leaf] else { return nil }
+                return result
+            }
+            return (item.top, values.min())
+        })
+    }
+
     /// 连测 3 次取最小（与单节点/离线一致）：首发常含冷启动握手，取最小更接近真实延迟。超时即止。
-    nonisolated private static func delayBest(port: Int, name: String, timeoutMs: Int) async -> Int? {
+    nonisolated private static func delayBest(port: Int, name: String, testURL: String, timeoutMs: Int) async -> Int? {
         var best: Int?
         for _ in 0..<3 {
-            guard let ms = await delay(port: port, name: name, timeoutMs: timeoutMs) else { break }
+            guard let ms = await delay(port: port, name: name, testURL: testURL, timeoutMs: timeoutMs) else { break }
             best = min(best ?? ms, ms)
         }
         return best
     }
 
-    nonisolated private static func delay(port: Int, name: String, timeoutMs: Int) async -> Int? {
+    nonisolated private static func delay(port: Int, name: String, testURL: String, timeoutMs: Int) async -> Int? {
         let enc = name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? name
-        let testURL = "http://cp.cloudflare.com/generate_204"   // Cloudflare 更普遍可达，gstatic 不少节点连不上
         let urlEnc = testURL.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? testURL
         guard let url = URL(string: "http://127.0.0.1:\(port)/proxies/\(enc)/delay?timeout=\(timeoutMs)&url=\(urlEnc)") else { return nil }
         let req = ClashAPI.request(url, timeout: Double(timeoutMs) / 1000 + 3)

@@ -9,12 +9,150 @@ import Foundation
 /// - 否则 → 合成 `Proxy`(selector, 含 `Auto` + 全部节点) + `Auto`(urltest, 全部节点)，主选择器 = `Proxy`。
 enum ProxyTopology {
     /// 合成模式的主选择器 / 自动组 tag（机场模式用机场原组名，不走这俩）。
-    static let masterTag = "Proxy"
-    static let autoTag = "Auto"
+    nonisolated static let masterTag = "Proxy"
+    nonisolated static let autoTag = "Auto"
 
-    /// url-test 健康检查地址：订阅常写死 www.gstatic.com，但不少节点连不上它 → url-test 全超时、
-    /// 选不出节点 → 走该组的流量直接断。统一覆盖成更普遍可达的 Cloudflare。
-    static let healthCheckURL = "http://cp.cloudflare.com/generate_204"
+    /// 正则表达式缓存（跨调用复用，避免重复编译相同 filter 模式）
+    nonisolated(unsafe) private static var regexCache: [String: NSRegularExpression] = [:]
+
+    /// LRU 双向链表节点（用 key 连接，避免引用类型在 Swift 并发检查下产生 actor 隔离 warning）。
+    private struct LRUEntry {
+        let key: String
+        var prev: String?
+        var next: String?
+    }
+
+    /// LRU 访问顺序跟踪（双向链表 + 字典，O(1) 访问和更新）
+    nonisolated(unsafe) private static var lruHead: String? = nil  // 最旧
+    nonisolated(unsafe) private static var lruTail: String? = nil  // 最新
+    nonisolated(unsafe) private static var lruNodes: [String: LRUEntry] = [:]  // key -> 链表节点
+
+    nonisolated private static let regexCacheLock = NSLock()
+    nonisolated private static let regexCacheMaxSize = 50
+
+    /// 验证正则模式复杂度，防止 ReDoS 攻击
+    nonisolated private static func isRegexSafe(_ pattern: String) -> Bool {
+        // 1. 拒绝反向引用（极高 ReDoS 风险）
+        // 反向引用会导致回溯复杂度指数级增长，如 (a*)\\1+
+        if pattern.contains("\\1") || pattern.contains("\\2") ||
+           pattern.contains("\\3") || pattern.contains("\\4") {
+            return false
+        }
+
+        // 2. 增强嵌套量词检测（ReDoS 的主要来源）
+        let nestedPatterns = [
+            #"\([^)]*[+*?]\)[+*?{]"#,        // 捕获组后量词: (a+)+
+            #"\(\?:[^)]*[+*?]\)[+*?{]"#,     // 非捕获组后量词: (?:a+)+
+            #"\|[^)]*[+*?]\)[+*?{]"#,        // 交替分支内量词: (a|b+)+
+        ]
+        for patternStr in nestedPatterns {
+            if let re = try? NSRegularExpression(pattern: patternStr),
+               re.firstMatch(in: pattern, range: NSRange(pattern.startIndex..., in: pattern)) != nil {
+                return false
+            }
+        }
+
+        // 3. 允许 Clash/Stash 常见的地区筛选 + 排除订阅信息正则；过长模式仍拒绝。
+        if pattern.count > 1024 {
+            return false
+        }
+
+        // 4. 拒绝超过 3 层嵌套的括号（复杂度指标）
+        var depth = 0, maxDepth = 0
+        for ch in pattern {
+            if ch == "(" { depth += 1; maxDepth = max(maxDepth, depth) }
+            else if ch == ")" { depth -= 1 }
+        }
+        if maxDepth > 3 {
+            return false
+        }
+
+        return true
+    }
+
+    /// 从 LRU 链表中移除节点
+    nonisolated private static func removeLRUNode(_ key: String) {
+        guard let node = lruNodes[key] else { return }
+        if let prev = node.prev {
+            lruNodes[prev]?.next = node.next
+        } else {
+            lruHead = node.next
+        }
+
+        if let next = node.next {
+            lruNodes[next]?.prev = node.prev
+        } else {
+            lruTail = node.prev
+        }
+
+        lruNodes[key]?.prev = nil
+        lruNodes[key]?.next = nil
+    }
+
+    /// 将节点移到 LRU 链表末尾（标记为最新访问）
+    nonisolated private static func moveToTail(_ key: String) {
+        if key == lruTail { return }  // 已在末尾
+
+        removeLRUNode(key)
+
+        // 追加到末尾
+        lruNodes[key]?.prev = lruTail
+        lruNodes[key]?.next = nil
+        if let tail = lruTail {
+            lruNodes[tail]?.next = key
+        }
+        lruTail = key
+
+        if lruHead == nil {
+            lruHead = key
+        }
+    }
+
+    /// 添加新节点到 LRU 链表末尾
+    nonisolated private static func addToTail(_ key: String) {
+        lruNodes[key] = LRUEntry(key: key, prev: lruTail, next: nil)
+        if let tail = lruTail {
+            lruNodes[tail]?.next = key
+        }
+        lruTail = key
+
+        if lruHead == nil {
+            lruHead = key
+        }
+    }
+
+    nonisolated private static func cachedRegex(_ pattern: String) -> NSRegularExpression? {
+        regexCacheLock.lock()
+        defer { regexCacheLock.unlock() }
+
+        // 安全检查：拒绝可能导致 ReDoS 的模式
+        guard isRegexSafe(pattern) else {
+            return nil
+        }
+
+        if let cached = regexCache[pattern] {
+            // O(1) 更新访问顺序（移到末尾）
+            if lruNodes[pattern] != nil {
+                moveToTail(pattern)
+            }
+            return cached
+        }
+
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        // 真正的 LRU：超过容量时删除最少使用的（链表头部）
+        if regexCache.count >= regexCacheMaxSize, let oldest = lruHead {
+            removeLRUNode(oldest)
+            regexCache.removeValue(forKey: oldest)
+            lruNodes.removeValue(forKey: oldest)
+        }
+
+        regexCache[pattern] = re
+        addToTail(pattern)
+        return re
+    }
 
     struct Result {
         /// 节点出站 + 组出站（不含 direct，调用方自行追加）。
@@ -37,7 +175,8 @@ enum ProxyTopology {
     nonisolated static func build(nodes: [ProxyNode],
                                   importedGroups: [[String: Any]],
                                   importedFinal: String?,
-                                  overrides: [String: String]) -> Result {
+                                  overrides: [String: String],
+                                  healthCheckURL: String = SettingsStore.defaultLatencyTestURL) -> Result {
         let (nodeOuts, nameToTag) = nodeOutbounds(nodes)
         let nodeTags = nodeOuts.compactMap { $0["tag"] as? String }
         var protoByTag: [String: String] = [:]
@@ -47,13 +186,23 @@ enum ProxyTopology {
         guard !nodeTags.isEmpty else {
             return Result(outbounds: [], master: "direct", groupOutbounds: [], protoByTag: [:], hasNodes: false)
         }
-        let groupOuts: [[String: Any]]
-        let master: String
+        var groupOuts: [[String: Any]]
+        var master: String
         if !importedGroups.isEmpty {
-            groupOuts = groupOutbounds(importedGroups, allNodeTags: nodeTags, nameToTag: nameToTag, overrides: overrides)
-            master = importedFinal ?? (importedGroups.first?["tag"] as? String) ?? masterTag
+            groupOuts = groupOutbounds(importedGroups, allNodeTags: nodeTags, nameToTag: nameToTag,
+                                       overrides: overrides, healthCheckURL: healthCheckURL)
+            if groupOuts.isEmpty {
+                groupOuts = synthesizedGroups(nodeTags: nodeTags, overrides: overrides, healthCheckURL: healthCheckURL)
+                master = masterTag
+            } else {
+                // master 必须指向实际存在的组：优先用 importedFinal（若存在），否则用第一个实际输出的组。
+                let actualGroupTags = Set(groupOuts.compactMap { $0["tag"] as? String })
+                master = importedFinal.flatMap { actualGroupTags.contains($0) ? $0 : nil }
+                    ?? groupOuts.first?["tag"] as? String
+                    ?? masterTag
+            }
         } else {
-            groupOuts = synthesizedGroups(nodeTags: nodeTags, overrides: overrides)
+            groupOuts = synthesizedGroups(nodeTags: nodeTags, overrides: overrides, healthCheckURL: healthCheckURL)
             master = masterTag
         }
         return Result(outbounds: nodeOuts + groupOuts, master: master,
@@ -63,7 +212,8 @@ enum ProxyTopology {
     /// 合成默认组（机场没给 proxy-groups 时）：
     /// `Auto`(urltest, 全部节点) + `Proxy`(selector, [Auto] + 全部节点, default = override ?? Auto)。
     /// 用户在 `Proxy` 里点 `Auto` = 按延迟自动；点某节点 = 钉住该节点。
-    nonisolated static func synthesizedGroups(nodeTags: [String], overrides: [String: String]) -> [[String: Any]] {
+    nonisolated static func synthesizedGroups(nodeTags: [String], overrides: [String: String],
+                                              healthCheckURL: String = SettingsStore.defaultLatencyTestURL) -> [[String: Any]] {
         let auto: [String: Any] = [
             "type": "urltest", "tag": autoTag, "outbounds": nodeTags,
             "url": healthCheckURL, "interval": "300s", "idle_timeout": "2100s",   // interval ≤ idle_timeout
@@ -115,39 +265,66 @@ enum ProxyTopology {
         return map
     }
 
+    nonisolated private static func orderedUnique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
+    }
+
     // MARK: proxy-group → 出站
 
     /// 把订阅 proxy-group 定义转成 sing-box selector / url-test 出站。成员名解析为节点 tag / 嵌套组 / direct；
     /// useAll 展开为全部节点；空组兜底为全部节点（或 direct）。
     /// url-test **永远只读自动**（sing-box / clash_api 不支持手动切 url-test）；要钉节点请切其父 selector。
     nonisolated static func groupOutbounds(_ groups: [[String: Any]], allNodeTags: [String], nameToTag: [String: String],
-                                           overrides: [String: String] = [:]) -> [[String: Any]] {
+                                           overrides: [String: String] = [:],
+                                           healthCheckURL: String = SettingsStore.defaultLatencyTestURL) -> [[String: Any]] {
         let groupTags = Set(groups.compactMap { $0["tag"] as? String })
         var outs: [[String: Any]] = []
+        var skippedGroups: Set<String> = []  // 记录被跳过的组
+
+        // 第一遍：构建所有组，记录被跳过的
         for g in groups {
             guard let tag = g["tag"] as? String, let type = g["type"] as? String else { continue }
             var members: [String] = []
-            if (g["useAll"] as? Bool) == true {
+            let declaredMembers = (g["members"] as? [String]) ?? []
+            let hasFilter = g["filter"] != nil || g["excludeFilter"] != nil
+            let shouldExpandNodePool = (g["useAll"] as? Bool) == true || (hasFilter && declaredMembers.isEmpty)
+            if shouldExpandNodePool {
                 // filter / exclude-filter（正则按节点名 = tag 筛选 use 展开的节点池）。
                 var pool = allNodeTags
-                if let f = g["filter"] as? String, let re = try? NSRegularExpression(pattern: f, options: [.caseInsensitive]) {
+                if let f = g["filter"] as? String {
+                    guard let re = cachedRegex(f) else {
+                        skippedGroups.insert(tag)
+                        continue
+                    }
                     pool = pool.filter { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil }
                 }
-                if let ex = g["excludeFilter"] as? String, let re = try? NSRegularExpression(pattern: ex, options: [.caseInsensitive]) {
+                if let ex = g["excludeFilter"] as? String {
+                    guard let re = cachedRegex(ex) else {
+                        skippedGroups.insert(tag)
+                        continue
+                    }
                     pool = pool.filter { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) == nil }
                 }
                 members += pool
             }
-            for name in (g["members"] as? [String] ?? []) {
-                if name == "DIRECT" { members.append("direct") }
-                else if name == "REJECT" || name == "REJECT-DROP" || name == "PASS" { continue }
+            for name in declaredMembers {
+                if name.uppercased() == "DIRECT" { members.append(SpecialOutbound.direct) }
+                else if SpecialOutbound.isBlocked(name) { continue }
                 else if groupTags.contains(name) { members.append(name) }      // 嵌套组
                 else if let t = nameToTag[name] { members.append(t) }          // 节点名
             }
             // 去重保序
-            var seen = Set<String>()
-            members = members.filter { seen.insert($0).inserted }
-            if members.isEmpty { members = allNodeTags.isEmpty ? ["direct"] : allNodeTags }
+            members = orderedUnique(members)
+            // 空组兜底：有过滤器且筛选为空时跳过该组（避免静默回退直连），
+            // 否则兜底为全部节点（无节点时才用 direct）。
+            if members.isEmpty {
+                if hasFilter && shouldExpandNodePool {
+                    skippedGroups.insert(tag)
+                    continue
+                }
+                members = allNodeTags.isEmpty ? ["direct"] : allNodeTags
+            }
             var o: [String: Any] = ["type": type, "tag": tag, "outbounds": members]
             if type == "urltest" {
                 o["url"] = healthCheckURL
@@ -167,6 +344,40 @@ enum ProxyTopology {
             }
             outs.append(o)
         }
+
+        // 清理所有组对被跳过组的引用；父组被清空时也跳过，继续向上传播。
+        var changed = true
+        var iterations = 0
+        let maxIterations = outs.count + 10  // 最多迭代次数 = 初始组数 + 安全边界
+        while changed && iterations < maxIterations {
+            iterations += 1
+            changed = false
+            for i in outs.indices.reversed() {
+                guard let tag = outs[i]["tag"] as? String,
+                      var members = outs[i]["outbounds"] as? [String] else { continue }
+                members.removeAll { skippedGroups.contains($0) }
+                if members.isEmpty {
+                    skippedGroups.insert(tag)
+                    outs.remove(at: i)
+                    changed = true
+                    continue
+                }
+                outs[i]["outbounds"] = members
+                if outs[i]["type"] as? String == "selector",
+                   let def = outs[i]["default"] as? String,
+                   !members.contains(def) {
+                    outs[i]["default"] = members.first
+                }
+            }
+        }
+
+        // 如果达到最大迭代次数，可能存在循环依赖（理论上不应发生）
+        // 此处静默处理，避免阻塞订阅刷新
+        if iterations >= maxIterations {
+            // 循环依赖检测：已达到最大迭代次数，可能订阅中存在循环引用
+            // 保留当前状态继续处理，避免完全失败
+        }
+
         return outs
     }
 }

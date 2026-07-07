@@ -30,6 +30,7 @@ enum ClashRuleImport {
         var ruleSetDefs: [[String: Any]] = []
         var seenTags = Set<String>()
         var finalOutbound: String?
+        var failedRuleSets: [String] = []  // 收集下载失败的 rule-set
 
         for raw in clashRules {
             let parts = raw.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
@@ -50,7 +51,10 @@ enum ClashRuleImport {
                     guard let prov = providers[arg], let url = prov["url"] as? String else { continue }
                     let behavior = (prov["behavior"] as? String ?? "classical").lowercased()
                     let file = dir.appendingPathComponent("\(tag).json")
-                    guard await downloadAndConvert(url, behavior: behavior, to: file, proxyPort: proxyPort) else { continue }
+                    guard await downloadAndConvert(url, behavior: behavior, to: file, proxyPort: proxyPort) else {
+                        failedRuleSets.append(tag)
+                        continue
+                    }
                     ruleSetDefs.append(["type": "local", "tag": tag, "format": "source", "path": file.path])
                     seenTags.insert(tag)
                 }
@@ -59,15 +63,27 @@ enum ClashRuleImport {
             case "GEOIP":
                 let code = sanitize(arg.lowercased())
                 guard !code.isEmpty else { continue }
+                if isPrivateGeoIP(code) {
+                    continue
+                }
                 let tag = "geoip-\(code)"
-                addRemoteGeo(tag, kind: "geoip", code: code, hasProxy: hasProxy, into: &ruleSetDefs, seen: &seenTags)
+                guard await addGeoRuleSet(tag, kind: "geoip", into: &ruleSetDefs, seen: &seenTags, dir: dir, proxyPort: proxyPort) else {
+                    failedRuleSets.append(tag)
+                    continue
+                }
                 sbRules.append(withAction(["rule_set": [tag]], out))
 
             case "GEOSITE":
                 let code = sanitize(arg.lowercased())
                 guard !code.isEmpty else { continue }
+                if isPrivateGeo(code) {
+                    continue
+                }
                 let tag = "geosite-\(code)"
-                addRemoteGeo(tag, kind: "geosite", code: code, hasProxy: hasProxy, into: &ruleSetDefs, seen: &seenTags)
+                guard await addGeoRuleSet(tag, kind: "geosite", into: &ruleSetDefs, seen: &seenTags, dir: dir, proxyPort: proxyPort) else {
+                    failedRuleSets.append(tag)
+                    continue
+                }
                 sbRules.append(withAction(["rule_set": [tag]], out))
 
             default:
@@ -75,6 +91,12 @@ enum ClashRuleImport {
                 guard addMatcher(type, arg, into: &m) else { continue }   // 不认识的类型跳过
                 for obj in m.ruleObjects() { sbRules.append(withAction(obj, out)) }
             }
+        }
+
+        // 如果有任何 rule-set 下载失败，视为本次 build 失败，保留旧缓存
+        // 防止部分成功的规则集替换完整的旧缓存，导致路由行为静默改变
+        guard failedRuleSets.isEmpty else {
+            return false
         }
 
         // 出站分组定义（makeConfig 据此 + 订阅节点生成 selector/url-test 出站）。
@@ -86,11 +108,11 @@ enum ClashRuleImport {
                 "tag": name,
                 "type": ctype == "select" ? "selector" : "urltest",   // url-test/fallback/load-balance → urltest
                 "members": (g["proxies"] as? [Any])?.compactMap { $0 as? String } ?? [],
-                "useAll": !((g["use"] as? [Any])?.isEmpty ?? true),    // use 任意 provider → 全部订阅节点
+                "useAll": !((g["use"] as? [Any])?.isEmpty ?? true) || (g["include-all"] as? Bool == true),
             ]
-            // filter / exclude-filter（正则，按节点名筛选 use 展开的节点）：现代机场常用
-            // `use:[provider] + filter:香港|HK` 给组按地区筛节点。Sail 把所有 provider 拍平成一个列表，
-            // 无法按 provider 限定范围，但能按名称正则筛——覆盖绝大多数 filter 用法。
+            // use/include-all + filter / exclude-filter（正则，按节点名筛选展开的节点池）：现代机场常用
+            // Clash 常见 `use:[provider] + filter:香港|HK`，Stash 常见 `include-all:true + filter`。
+            // Sail 已把订阅节点拍平成当前订阅节点池，因此两者都展开为当前订阅节点池后按名称正则筛选。
             if let f = g["filter"] as? String, !f.isEmpty { gd["filter"] = f }
             if let ex = g["exclude-filter"] as? String, !ex.isEmpty { gd["excludeFilter"] = ex }
             if gd["type"] as? String == "urltest" {
@@ -115,8 +137,11 @@ enum ClashRuleImport {
         -> (rules: [[String: Any]], ruleSet: [[String: Any]], final: String?, groups: [[String: Any]])? {
         guard let data = try? Data(contentsOf: dir.appendingPathComponent("route.json")),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return (obj["rules"] as? [[String: Any]] ?? [],
-                obj["rule_set"] as? [[String: Any]] ?? [],
+        let normalized = normalizePrivateGeoIP(
+            rules: obj["rules"] as? [[String: Any]] ?? [],
+            ruleSet: obj["rule_set"] as? [[String: Any]] ?? [])
+        return (normalized.rules,
+                normalized.ruleSet,
                 obj["final"] as? String,
                 obj["groups"] as? [[String: Any]] ?? [])
     }
@@ -129,13 +154,94 @@ enum ClashRuleImport {
         return r
     }
 
-    private nonisolated static func addRemoteGeo(_ tag: String, kind: String, code: String, hasProxy: Bool,
-                                                 into defs: inout [[String: Any]], seen: inout Set<String>) {
-        guard !seen.contains(tag) else { return }
+    private nonisolated static func addGeoRuleSet(_ tag: String,
+                                                  kind: String,
+                                                  into defs: inout [[String: Any]],
+                                                  seen: inout Set<String>,
+                                                  dir: URL,
+                                                  proxyPort: Int?) async -> Bool {
+        guard !seen.contains(tag) else { return true }
+        let file = dir.appendingPathComponent("\(tag).srs")
         let url = "https://raw.githubusercontent.com/SagerNet/sing-\(kind)/rule-set/\(tag).srs"
-        defs.append(["type": "remote", "tag": tag, "format": "binary", "url": url,
-                     "download_detour": hasProxy ? "proxy" : "direct"])
-        seen.insert(tag)
+        if await downloadSRS(url, to: file, proxyPort: proxyPort) {
+            defs.append(["type": "local", "tag": tag, "format": "binary", "path": file.path])
+            seen.insert(tag)
+            return true
+        }
+        // 已有全局本地副本时兜底使用，仍避免运行期 remote rule_set 初始化导致内核 FATAL。
+        if let local = GeoData.localRuleSet(tag) {
+            defs.append(["type": "local", "tag": tag, "format": "binary", "path": local.path])
+            seen.insert(tag)
+            return true
+        }
+        return false
+    }
+
+    private nonisolated static func downloadSRS(_ urlString: String, to file: URL, proxyPort: Int?) async -> Bool {
+        guard let url = URL(string: urlString) else { return false }
+        let cfg = URLSessionConfiguration.ephemeral
+        if let port = proxyPort {
+            cfg.connectionProxyDictionary = [
+                kCFNetworkProxiesHTTPEnable as String: true,
+                kCFNetworkProxiesHTTPProxy as String: "127.0.0.1",
+                kCFNetworkProxiesHTTPPort as String: port,
+                kCFNetworkProxiesHTTPSEnable as String: true,
+                kCFNetworkProxiesHTTPSProxy as String: "127.0.0.1",
+                kCFNetworkProxiesHTTPSPort as String: port,
+            ]
+        }
+        do {
+            let (tmp, resp) = try await URLSession(configuration: cfg).download(from: url)
+            guard (resp as? HTTPURLResponse)?.statusCode == 200,
+                  isValidSRS(tmp) else { return false }
+            try? FileManager.default.removeItem(at: file)
+            try FileManager.default.moveItem(at: tmp, to: file)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private nonisolated static func isValidSRS(_ file: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return false }
+        defer { try? handle.close() }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let size = attrs[.size] as? NSNumber,
+              size.intValue > 64 else { return false }
+        let magic = handle.readData(ofLength: 3)
+        return magic == Data([0x53, 0x52, 0x53])
+    }
+
+    private nonisolated static func isPrivateGeoIP(_ code: String) -> Bool {
+        code == "private" || code == "lan"
+    }
+
+    private nonisolated static func isPrivateGeo(_ code: String) -> Bool {
+        code == "private"
+    }
+
+    private nonisolated static func normalizePrivateGeoIP(rules: [[String: Any]], ruleSet: [[String: Any]])
+        -> (rules: [[String: Any]], ruleSet: [[String: Any]]) {
+        let privateTags = Set(["geoip-private", "geoip-lan", "geosite-private"])
+        let filteredRuleSet = ruleSet.filter { set in
+            guard let tag = set["tag"] as? String else { return true }
+            return !privateTags.contains(tag)
+        }
+        var normalizedRules: [[String: Any]] = []
+        for rule in rules {
+            guard let tags = rule["rule_set"] as? [String],
+                  tags.contains(where: { privateTags.contains($0) }) else {
+                normalizedRules.append(rule)
+                continue
+            }
+            let remaining = tags.filter { !privateTags.contains($0) }
+            if !remaining.isEmpty {
+                var kept = rule
+                kept["rule_set"] = remaining
+                normalizedRules.append(kept)
+            }
+        }
+        return (normalizedRules, filteredRuleSet)
     }
 
     // MARK: Clash 规则体 → sing-box matcher
@@ -144,7 +250,10 @@ enum ClashRuleImport {
         var domain: [String] = [], domainSuffix: [String] = [], domainKeyword: [String] = []
         var ipCidr: [String] = [], process: [String] = [], sourceIPCidr: [String] = []
         var port: [Int] = []
-        func ruleObjects() -> [[String: Any]] {
+
+        nonisolated init() {}
+
+        nonisolated func ruleObjects() -> [[String: Any]] {
             var r: [[String: Any]] = []
             if !domain.isEmpty { r.append(["domain": domain]) }
             if !domainSuffix.isEmpty { r.append(["domain_suffix": domainSuffix]) }

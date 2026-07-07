@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CoreImage.CIFilterBuiltins
+import UniformTypeIdentifiers
 
 /// 订阅页面：纯订阅信息，平铺卡片展示（不含节点；选节点在首页下拉里）。
 struct SubscriptionsView: View {
@@ -47,9 +48,13 @@ struct SubscriptionsView: View {
                     .help("全部刷新")
                 }
                 Button { importFromClipboard() } label: {
-                    Image(systemName: "doc.on.clipboard")
+                    Image(systemName: "doc.on.doc")
                 }
                 .help("从剪贴板导入订阅")
+                Button { importLocalFile() } label: {
+                    Image(systemName: "folder.badge.plus")
+                }
+                .help("导入本地订阅文件")
                 Button { showingAdd = true } label: {
                     Image(systemName: "plus")
                 }
@@ -77,6 +82,23 @@ struct SubscriptionsView: View {
             .trimmingCharacters(in: .whitespacesAndNewlines),
               raw.hasPrefix("http") else { return }
         Task { await store.add(name: "", url: raw) }
+    }
+
+    private func importLocalFile() {
+        let panel = NSOpenPanel()
+        panel.title = "选择本地订阅文件"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "yaml"),
+            UTType(filenameExtension: "yml"),
+            .json,
+            .plainText,
+            UTType(filenameExtension: "conf"),
+        ].compactMap { $0 }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await store.addLocalFile(url) }
     }
 
     private var summaryHeader: some View {
@@ -115,6 +137,7 @@ private struct SubscriptionCard: View {
     @State private var hovering = false
     @State private var shown = false
     @State private var confirmingDelete = false
+    @State private var exportError: String?
 
     static let dateFmt: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f
@@ -174,8 +197,17 @@ private struct SubscriptionCard: View {
             .disabled(!KernelRunner.shared.isRunning)
             Divider()
             Button { onEdit() } label: { Label("编辑信息", systemImage: "pencil") }
-            Button { onQR() } label: { Label("分享二维码", systemImage: "qrcode") }
-            Button { copyToPasteboard(sub.url) } label: { Label("复制链接", systemImage: "doc.on.doc") }
+                .disabled(sub.isLocalFile)
+            if !sub.isLocalFile {
+                Button { onQR() } label: { Label("分享二维码", systemImage: "qrcode") }
+            }
+            Button { exportConvertedConfig() } label: {
+                Label("导出转换后配置", systemImage: "square.and.arrow.down")
+            }
+            .disabled(sub.nodes.isEmpty)
+            Button { copyToPasteboard(sub.url) } label: {
+                Label(sub.isLocalFile ? "复制路径" : "复制链接", systemImage: "doc.on.doc")
+            }
             Divider()
             Button(role: .destructive) { confirmingDelete = true } label: {
                 Label("删除", systemImage: "trash")
@@ -187,6 +219,29 @@ private struct SubscriptionCard: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("将移除该订阅及其节点，此操作不可撤销。")
+        }
+        .alert("导出失败", isPresented: Binding(
+            get: { exportError != nil },
+            set: { if !$0 { exportError = nil } }
+        )) {
+            Button("确定", role: .cancel) { exportError = nil }
+        } message: {
+            Text(exportError ?? "")
+        }
+    }
+
+    private func exportConvertedConfig() {
+        do {
+            let data = try KernelRunner.shared.exportConfigData(for: sub)
+            let panel = NSSavePanel()
+            panel.title = "导出转换后配置"
+            panel.nameFieldStringValue = "\(safeFileName(sub.name.isEmpty ? "Sail" : sub.name))-sing-box.json"
+            panel.allowedContentTypes = [.json]
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try data.write(to: url, options: .atomic)
+        } catch {
+            exportError = (error as? KernelError)?.description ?? error.localizedDescription
         }
     }
 
@@ -211,6 +266,11 @@ private struct SubscriptionCard: View {
                 Text(sub.lastError == nil ? "\(sub.nodes.count) 个节点" : "更新失败")
                     .font(.system(size: 11))
                     .foregroundStyle(sub.lastError == nil ? Color.secondary : Color.red)
+                if sub.isLocalFile {
+                    Label("本地文件", systemImage: "doc")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                }
             }
             Spacer(minLength: 0)
             trailingControls
@@ -286,6 +346,13 @@ private struct SubscriptionCard: View {
         if selected { return Color.accentColor.opacity(0.85) }
         if hovering { return Color.accentColor.opacity(0.35) }
         return Color(nsColor: .separatorColor).opacity(0.5)
+    }
+
+    private func safeFileName(_ raw: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>")
+        let cleaned = raw.components(separatedBy: invalid).joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "Sail" : cleaned
     }
 }
 

@@ -98,6 +98,7 @@ struct GroupsView: View {
         let testing = store.testing.contains(group.name)
         let badge = isAuto ? "自动" : "手动"
         let accent = isAuto ? Color.mint : Color.accentColor
+        let nodeCount = resolvedNodeCount(for: group)
         return HStack(spacing: 10) {
             Text(group.name).font(.system(size: 16, weight: .semibold, design: .rounded)).lineLimit(1)
             Text(badge)
@@ -105,7 +106,7 @@ struct GroupsView: View {
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(accent.opacity(0.16), in: Capsule())
                 .foregroundStyle(accent)
-            Text("\(group.members.count) 个节点").font(.system(size: 11)).foregroundStyle(.secondary)
+            Text("\(nodeCount) 个节点").font(.system(size: 11)).foregroundStyle(.secondary)
             Spacer(minLength: 8)
             Button { Task { await store.testGroup(group) } } label: {
                 if testing { HStack(spacing: 5) { Spinner(size: 12); Text("测速中") } }
@@ -116,6 +117,27 @@ struct GroupsView: View {
             .help(store.live ? "测速整组" : "测速整组（内核未运行，用临时实例测）")
         }
         .padding(.horizontal, 18).padding(.vertical, 12)
+    }
+
+    private func resolvedNodeCount(for group: ProxyGroupStore.Group) -> Int {
+        let byName = Dictionary(groups.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        var nodes = Set<String>()
+        var visiting = Set<String>()
+
+        func visit(_ group: ProxyGroupStore.Group) {
+            guard visiting.insert(group.name).inserted else { return }
+            defer { visiting.remove(group.name) }
+            for member in group.members {
+                if member.isGroup, let nested = byName[member.name] {
+                    visit(nested)
+                } else if !SpecialOutbound.isSpecial(member.name) {
+                    nodes.insert(member.name)
+                }
+            }
+        }
+
+        visit(group)
+        return nodes.count
     }
 
     /// 离线提示条：内核未运行时，分组来自订阅持久化结构；选择已记住、测速走临时实例，切换实际生效需内核启动。

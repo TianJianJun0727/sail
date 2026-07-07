@@ -10,7 +10,7 @@ struct ProxyNode: Codable, Identifiable, Equatable {
     var port: Int
     var outboundJSON: String
 
-    var label: String { name.isEmpty ? "\(server):\(port)" : name }
+    nonisolated var label: String { name.isEmpty ? "\(server):\(port)" : name }
 
     /// 内容相等：以 outboundJSON 为准（其中含 tag=name + 完整出站配置，是节点的稳定指纹）。
     /// 不比较随机 id —— 订阅刷新会重新解析、id 全变，按 id 判等会让选中态/归属判断在刷新后失配。

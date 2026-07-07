@@ -20,9 +20,6 @@ final class LatencyTester {
     private(set) var results: [String: Result] = [:]
     private(set) var running = false
 
-    // 连通性探测地址：Cloudflare 比 gstatic 更普遍可达（不少节点连不上 www.gstatic.com → 测速全超时）
-    private let testURL = "http://cp.cloudflare.com/generate_204"
-
     private init() {}
 
     func result(for node: ProxyNode) -> Result? { results[node.outboundJSON] }
@@ -109,7 +106,7 @@ final class LatencyTester {
         guard ready else { markTimeout(nodes); return }
 
         // 并发测速（限并发，避免一次性打满）
-        let port = apiPort, url = testURL
+        let port = apiPort, url = SettingsStore.shared.latencyTestURL
         await withTaskGroup(of: (Int, Result).self) { group in
             var next = 0
             let limit = min(8, nodes.count)
