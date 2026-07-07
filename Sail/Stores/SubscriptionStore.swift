@@ -250,7 +250,6 @@ final class SubscriptionStore {
         try? FileManager.default.removeItem(at: tmpDir)
         let ok = await ClashRuleImport.build(yaml: clashText,
                                              into: tmpDir,
-                                             routeBaseDir: finalDir,
                                              hasProxy: true,
                                              proxyPort: proxyPort)
         guard ok else {

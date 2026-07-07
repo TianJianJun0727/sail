@@ -14,13 +14,11 @@ enum ClashRuleImport {
     @discardableResult
     nonisolated static func build(yaml: String,
                                   into dir: URL,
-                                  routeBaseDir: URL? = nil,
                                   hasProxy: Bool,
                                   proxyPort: Int?) async -> Bool {
         let clashRules = ClashYAMLParser.rules(yaml)
         guard !clashRules.isEmpty else { return false }
         let providers = ClashYAMLParser.ruleProviders(yaml)
-        let routeDir = routeBaseDir ?? dir
 
         // 去向直接指向真实组名（该组会作为 selector/url-test 出站被生成）；DIRECT→直连，REJECT→拦截(nil)。
         func outboundFor(_ target: String) -> String? {
@@ -56,13 +54,12 @@ enum ClashRuleImport {
                     guard let prov = providers[arg], let url = prov["url"] as? String else { continue }
                     let behavior = (prov["behavior"] as? String ?? "classical").lowercased()
                     let file = dir.appendingPathComponent("\(tag).json")
-                    let routePath = routeDir.appendingPathComponent(file.lastPathComponent)
                     let cache = cacheFile(prefix: tag, key: "source|\(behavior)|\(url)", ext: "json")
                     guard await downloadAndConvert(url, behavior: behavior, to: file, cacheFile: cache, proxyPort: proxyPort) else {
                         failedRuleSets.append(tag)
                         continue
                     }
-                    ruleSetDefs.append(["type": "local", "tag": tag, "format": "source", "path": routePath.path])
+                    ruleSetDefs.append(["type": "local", "tag": tag, "format": "source", "path": file.lastPathComponent])
                     seenTags.insert(tag)
                 }
                 sbRules.append(withAction(["rule_set": [tag]], out))
@@ -74,7 +71,7 @@ enum ClashRuleImport {
                     continue
                 }
                 let tag = "geoip-\(code)"
-                guard await addGeoRuleSet(tag, kind: "geoip", into: &ruleSetDefs, seen: &seenTags, dir: dir, routeDir: routeDir, proxyPort: proxyPort) else {
+                guard await addGeoRuleSet(tag, kind: "geoip", into: &ruleSetDefs, seen: &seenTags, dir: dir, proxyPort: proxyPort) else {
                     failedRuleSets.append(tag)
                     continue
                 }
@@ -87,7 +84,7 @@ enum ClashRuleImport {
                     continue
                 }
                 let tag = "geosite-\(code)"
-                guard await addGeoRuleSet(tag, kind: "geosite", into: &ruleSetDefs, seen: &seenTags, dir: dir, routeDir: routeDir, proxyPort: proxyPort) else {
+                guard await addGeoRuleSet(tag, kind: "geosite", into: &ruleSetDefs, seen: &seenTags, dir: dir, proxyPort: proxyPort) else {
                     failedRuleSets.append(tag)
                     continue
                 }
@@ -169,15 +166,13 @@ enum ClashRuleImport {
                                                   into defs: inout [[String: Any]],
                                                   seen: inout Set<String>,
                                                   dir: URL,
-                                                  routeDir: URL,
                                                   proxyPort: Int?) async -> Bool {
         guard !seen.contains(tag) else { return true }
         let file = dir.appendingPathComponent("\(tag).srs")
-        let routePath = routeDir.appendingPathComponent(file.lastPathComponent)
         let url = "https://raw.githubusercontent.com/SagerNet/sing-\(kind)/rule-set/\(tag).srs"
         let cache = cacheFile(prefix: tag, key: "binary|\(url)", ext: "srs")
         if await downloadSRS(url, to: file, cacheFile: cache, proxyPort: proxyPort) {
-            defs.append(["type": "local", "tag": tag, "format": "binary", "path": routePath.path])
+            defs.append(["type": "local", "tag": tag, "format": "binary", "path": file.lastPathComponent])
             seen.insert(tag)
             return true
         }
@@ -238,7 +233,7 @@ enum ClashRuleImport {
         ruleSet.map { set in
             guard (set["type"] as? String) == "local",
                   let path = set["path"] as? String else { return set }
-            if FileManager.default.fileExists(atPath: path) { return set }
+            if path.hasPrefix("/") && FileManager.default.fileExists(atPath: path) { return set }
             let fallback = dir.appendingPathComponent(URL(fileURLWithPath: path).lastPathComponent)
             guard FileManager.default.fileExists(atPath: fallback.path) else { return set }
             var fixed = set
