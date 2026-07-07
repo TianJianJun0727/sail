@@ -702,7 +702,11 @@ final class KernelRunner {
             // 否则 macOS 会把 IPv6 流量塞进 TUN，而本应用默认无 IPv6 出口 → 既「连上无数据」，
             // 还会让发往 TUN 自身 ULA 网关的 UDP 命中 ip_is_private 判直连而回环 TUN，导致 CPU 空转、上传虚高。
             var tunAddress = ["172.18.0.1/30"]
-            if settings.dnsStrategy != "ipv4_only" { tunAddress.append("fdfe:dcba:9876::1/126") }
+            var tunDNSAddress = ["172.18.0.2"]
+            if settings.dnsStrategy != "ipv4_only" {
+                tunAddress.append("fdfe:dcba:9876::1/126")
+                tunDNSAddress.append("fdfe:dcba:9876::2")
+            }
             var tunIn: [String: Any] = [
                 "type": "tun",
                 "tag": "tun-in",
@@ -712,6 +716,10 @@ final class KernelRunner {
                 "stack": t.stack,
                 "mtu": t.mtu,
             ]
+            if t.dnsHijack {
+                tunIn["dns_mode"] = "hijack"
+                tunIn["dns_address"] = tunDNSAddress
+            }
             if !t.interfaceName.isEmpty { tunIn["interface_name"] = t.interfaceName }
             let cidrs = t.excludeCIDR.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
             if !cidrs.isEmpty { tunIn["route_exclude_address"] = cidrs }
