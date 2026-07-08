@@ -4,6 +4,13 @@
 > 写本次更新内容；CI（`.github/workflows/release.yml`）按 tag 自动提取对应小节注入 GitHub Release，
 > App「设置 › 关于」在检测到新版本时展示这段内容。版本号与 `MARKETING_VERSION` 保持一致。
 
+## 1.2.0
+
+- 基于订阅规则和 1.13 TUN DNS 兼容修复升级到 sing-box 1.14.0-alpha.39，作为 1.2.0 测试分支发布。
+- 调整 1.14 TUN DNS 接管方式：TUN DNS 查询通过 helper 转发到内核 DNS 服务，避免 macOS 系统 DNS 指向本地 TUN 地址后无法稳定解析。
+- 按内核版本同步 App 内置 sing-box 二进制，避免关于页版本、打包资源和实际运行内核不一致。
+- 延续 TUN/helper 异常恢复和 DNS 引用规范化修复，确保 helper 失联、启动失败或 Mixin 引用 `system-dns` 时不会留下不可用 DNS 配置。
+
 ## 1.1.23
 
 - 修复 sing-box 1.13 兼容分支的 TUN DNS 接管：仅在开启 DNS 劫持时临时接管系统 DNS，避免关闭劫持时也把系统 DNS 指向本地 TUN 地址。
