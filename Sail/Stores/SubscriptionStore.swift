@@ -254,6 +254,8 @@ final class SubscriptionStore {
                                              proxyPort: proxyPort)
         guard ok else {
             try? FileManager.default.removeItem(at: tmpDir)
+            // 节点刷新已成功；规则构建失败时保留旧 subrules，避免一次网络或规则集错误清掉仍可用的缓存。
+            NSLog("%@", "[Sail] 订阅节点已刷新，但导入订阅规则失败，继续沿用旧规则缓存 id=\(id.uuidString)")
             return
         }
         try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
