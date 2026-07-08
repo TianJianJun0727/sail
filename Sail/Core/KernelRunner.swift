@@ -514,13 +514,13 @@ final class KernelRunner {
                 guard !Task.isCancelled, self.ranViaHelper, self.runState == .running else { misses = 0; continue }
                 if alive { misses = 0; continue }
                 misses += 1
-                if misses >= 2 { self.handleHelperCrash(); return }
+                if misses >= 2 { await self.handleHelperCrash(); return }
             }
         }
     }
 
     /// helper 内核崩溃处理：复用直跑模式的限次退避自动重启逻辑。
-    private func handleHelperCrash() {
+    private func handleHelperCrash() async {
         guard ranViaHelper, runState == .running else { return }
         appendLogs(["[监测] 连续探测失败，判定 TUN(root) 内核已退出 → 进入自动重启（注意：若此时是误判，root 内核其实还活着，会与随后启动的内核抢 7890）"])
         let uptime = startedAt.map { Date().timeIntervalSince($0) } ?? 0
@@ -530,6 +530,10 @@ final class KernelRunner {
         TrafficMonitor.shared.stop()
         helperLogTask?.cancel(); helperLogTask = nil
         helperWatchTask = nil   // 当前 watch 正在退出
+        if SettingsStore.shared.tun.dnsHijack {
+            _ = await SailHelperClient.restoreDNS()
+            tunOriginalDNSServers.removeAll()
+        }
 
         if uptime > 30 { crashCount = 0 }   // 健康跑过 30s 视作偶发，重置计数
         let why = "TUN 内核异常退出"
@@ -879,10 +883,28 @@ final class KernelRunner {
 
         // 最后一步：用户 Mixin 深合并覆盖（启用时）。放在最后，可覆盖以上任意生成字段。
         let finalConfig = applyMixin ? MixinStore.shared.apply(to: config) : config
-        return normalizeDNSReferences(finalConfig, systemServer: dnsServer(provider: .system, tag: "system-dns", domainResolver: nil))
+        return normalizeDNSReferences(finalConfig)
     }
 
-    private func normalizeDNSReferences(_ config: [String: Any], systemServer: [String: Any]) -> [String: Any] {
+    private func systemDNSServer(tag: String) -> [String: Any] {
+        let settings = SettingsStore.shared
+        let originalSystemDNSServer = tunOriginalDNSServers.first {
+            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && trimmed != Self.tunDNSAddress
+        }
+        if settings.tunEnabled, settings.tun.dnsHijack, let originalSystemDNSServer {
+            return [
+                "tag": tag,
+                "type": "udp",
+                "server": originalSystemDNSServer,
+                "server_port": 53,
+                "detour": "direct",
+            ]
+        }
+        return DNSProvider.system.server(tag: tag, domainResolver: nil)
+    }
+
+    private func normalizeDNSReferences(_ config: [String: Any]) -> [String: Any] {
         guard var dns = config["dns"] as? [String: Any] else { return config }
         var servers = dns["servers"] as? [[String: Any]] ?? []
         let tags = Set(servers.compactMap { $0["tag"] as? String })
@@ -901,7 +923,7 @@ final class KernelRunner {
         if let rules = dns["rules"] { collectServers(rules) }
 
         if referencedServers.contains("system-dns"), !tags.contains("system-dns") {
-            servers.append(systemServer)
+            servers.append(systemDNSServer(tag: "system-dns"))
             dns["servers"] = servers
             var normalized = config
             normalized["dns"] = dns
@@ -917,6 +939,7 @@ final class KernelRunner {
         if let overlay = MixinStore.parseObject(mixinText) {
             cfg = MixinStore.deepMerge(cfg, overlay, overlayWins: MixinStore.shared.priority == .mixinWins)
         }
+        cfg = normalizeDNSReferences(cfg)
         guard let data = try? JSONSerialization.data(withJSONObject: cfg, options: [.prettyPrinted]) else {
             return "生成配置失败"
         }
